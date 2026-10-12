@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
@@ -319,3 +320,79 @@ def test_comment_is_posted_via_body_file():
     script = _step_script(VERDICT_STEP)
     assert "--body-file" in script
     assert '--body "' not in script
+
+
+# ------------------------------------------------------- Genesis Deck 混合初審
+
+GDECK_STEP = "Genesis Deck 初審（地端）"
+
+
+def _precheck_env(tmp_path: Path, token: str, gdeck_on: str, gdeck_key: str) -> dict[str, str]:
+    out = tmp_path / "gh-output.txt"
+    out.write_text("", encoding="utf-8")
+    res = _run(
+        _step_script(PRECHECK_STEP), tmp_path, _fake_gh(tmp_path),
+        {"GITHUB_OUTPUT": out.as_posix(), "PR_AUTHOR": "gsinvest017-ai", "PR_AUTHOR_TYPE": "User",
+         "TOKEN": token, "GDECK_ON": gdeck_on, "GDECK_KEY": gdeck_key},
+    )
+    assert res.returncode == 0, res.stderr
+    return dict(l.split("=", 1) for l in out.read_text(encoding="utf-8").splitlines() if l)
+
+
+@pytest.mark.parametrize(
+    "token, on, key, expect",
+    [
+        ("", "true", "k", {"skip": "false", "gdeck": "true", "claude": "false"}),
+        ("tok", "true", "", {"skip": "false", "gdeck": "false", "claude": "true"}),
+        ("tok", "false", "k", {"skip": "false", "gdeck": "false", "claude": "true"}),
+        ("", "true", "", {"skip": "true", "gdeck": "false", "claude": "false"}),
+    ],
+)
+def test_precheck_gdeck_matrix(tmp_path, token, on, key, expect):
+    got = _precheck_env(tmp_path, token, on, key)
+    assert {k: got.get(k) for k in expect} == expect
+
+
+def _gdeck_step(tmp_path: Path, files: str, diff: str, max_chars: int = 30000) -> str:
+    """跑地端初審 step；只測「不打網路就能決定升級」的分支，回傳寫進 GITHUB_OUTPUT 的內容。"""
+    (tmp_path / "pr.diff").write_text(diff, encoding="utf-8")
+    (tmp_path / "pr-meta.txt").write_text("標題: t", encoding="utf-8")
+    out = tmp_path / "gh-output.txt"
+    out.write_text("", encoding="utf-8")
+    doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    paths = doc[True]["workflow_call"]["inputs"]["escalate_paths"]["default"]
+    bindir = _fake_gh(tmp_path, files)
+    # step 用 python3；Windows 的 Git Bash 不一定找得到，指向跑測試的這個直譯器
+    shim = bindir / "python3"
+    shim.write_text(f'#!/usr/bin/env bash\nexec "{_msys(Path(sys.executable))}" "$@"\n',
+                    encoding="utf-8", newline="\n")
+    shim.chmod(0o755)
+    res = _run(
+        _step_script(GDECK_STEP), tmp_path, bindir,
+        {"GITHUB_OUTPUT": out.as_posix(), "GDECK_API_KEY": "k", "GDECK_MODEL": "m", "PR": "1",
+         "MAX_CHARS": str(max_chars), "ESCALATE_PATHS": paths, "REPO": "o/r", "PROJECT_CONTEXT": ""},
+    )
+    assert res.returncode == 0, res.stderr
+    assert not (tmp_path / "review-output.md").exists(), "升級時地端不能先寫出 review"
+    return out.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "files",
+    [".github/workflows/ci.yml", "src/auth/login.py", "app/secrets.py", "Dockerfile", "certs/server.pem"],
+)
+def test_gdeck_escalates_high_risk_paths(tmp_path, files):
+    assert "escalate=true" in _gdeck_step(tmp_path, f"README.md\n{files}", "small diff")
+
+
+def test_gdeck_escalates_large_diff(tmp_path):
+    assert "escalate=true" in _gdeck_step(tmp_path, "src/app.py", "x" * 101, max_chars=100)
+
+
+def test_claude_step_runs_only_when_needed():
+    """沒開地端時照舊跑 Claude；開了的話只在升級（或地端那步沒輸出）時跑。"""
+    doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    step = next(s for s in doc["jobs"]["review"]["steps"] if s.get("name") == "Claude review（教學語氣）")
+    cond = step["if"]
+    assert "steps.precheck.outputs.claude == 'true'" in cond
+    assert "steps.gdeck.outputs.escalate != 'false'" in cond   # 空字串（地端壞掉）也要升級

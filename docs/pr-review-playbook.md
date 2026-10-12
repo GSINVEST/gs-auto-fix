@@ -203,3 +203,32 @@ CI 與 AI review 都會跑。
   缺 secret 時 review 乾淨跳過並回綠燈，git 歷史上會看到「每個 PR 都通過 review」，
   但實際一次都沒跑過。設 required check 前先確認 secret 已存在：
   `gh secret list -R <owner>/<repo> | grep CLAUDE_CODE_OAUTH_TOKEN`
+
+---
+
+## 混合初審：先給公司地端 Genesis Deck（2026-10-09，opt-in）
+
+Claude 訂閱額度共用（見上），而大多數 PR 是小改動。開了 `gdeck_first_pass` 之後：
+
+| 情況 | 誰審 |
+|---|---|
+| diff ≤ `gdeck_max_diff_chars`（預設 30000 字元）且沒碰到 `escalate_paths` | Genesis Deck 定案（yes／no 都算數），留言註明由公司地端模型審 |
+| diff 太大、碰到高風險路徑（workflow、auth／secret、Dockerfile、金鑰檔）| Claude |
+| Genesis Deck 連不到、回錯、沒給出明確判定、這一步自己壞掉 | Claude |
+| 需要升級但 repo 沒有 `CLAUDE_CODE_OAUTH_TOKEN` | 沒有 review 產出 → 照既有 fail-closed 規則標 `needs-work` |
+
+呼叫端：
+
+```yaml
+    uses: gsinvest017-ai/gs-auto-fix/.github/workflows/_reusable-pr-review.yml@<含本功能的 tag>
+    secrets: inherit                 # 需要 GDECK_API_KEY（keyctl.sh add <email> <用途>）
+    with:
+      gdeck_first_pass: true
+      runs_on: '["self-hosted", "Linux"]'   # 必須在公司網路內
+```
+
+- **為什麼要 self-hosted runner**：Genesis Deck gateway 只放行公司出口 IP，GitHub 雲端 runner 連不到。runner 要註冊給**呼叫端 repo**（個人帳號底下的 repo 沒有共用 runner）。
+- **安全模型不變**：仍然不 checkout、不執行 PR 程式碼；地端模型同樣沒有任何工具，diff 以文字附在訊息裡，輸出只寫進 `review-output.md`，貼留言與加 label 仍由固定邏輯做。self-hosted runner 只跑 base 分支定義的步驟。
+- **guard 仍在最前面**：敏感路徑命中時連地端也不送。
+- 地端 prompt 是 Claude prompt 的精簡版，**改 Claude prompt 時同步改 `Genesis Deck 初審` 那一步**。
+- 實測（本機抽出 step 對真 gateway）：一個把分母改成 `len(xs) - 1` 的 PR，地端正確判 `NEEDS_WORK: yes` 並給出修法；但它舉的數值例子算錯（說 `[1,2,3]` 會得 1.5，實際是 3）。結論對、細節可能錯——這是定案範圍限在小而低風險 PR 的理由。
