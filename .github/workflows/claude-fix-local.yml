@@ -1,12 +1,15 @@
 # 地端先修 gate（PoC1，純附加，不改既有 claude-fix.yml）。
 #
 # 設計：用「新 label local-fix-first」當入口，避免與既有吃 auto-fix label 的雲端
-#       claude-fix.yml 同時觸發。地端 qwen3-coder 修好 → 開 claude/* PR（接既有
+#       claude-fix.yml 同時觸發。地端模型修好 → 開 claude/* PR（接既有
 #       auto-merge.yml）；修不掉 → 自動補 auto-fix label，升級到既有雲端流程。
 #
-# 前置：需註冊一台 self-hosted runner（label: self-hosted, gpu, ollama）且已備
-#       Ollama + qwen3-coder（即使用者的 RTX 5090 機）。未註冊前此 workflow 不會
-#       佔用任何資源（沒有 matching runner 就不會排程）。
+# 地端模型（2026-10-09 起）：公司地端 Genesis Deck API（gs-agent-router
+#       `--local-backend gdeck`），不再用本機 Ollama + qwen3-coder，所以 runner 不需要 GPU。
+#       Genesis Deck gateway 只放行公司出口 IP，GitHub 雲端 runner 連不到，
+#       仍須跑在公司網路內的 self-hosted Windows runner（rtx5090-win）。
+#
+# 前置：repo secret GDECK_API_KEY（keyctl.sh add <email> gs-auto-fix-ci）。
 name: Claude local-first fix gate
 
 on:
@@ -23,10 +26,9 @@ permissions:
   issues: write
   pull-requests: write
 
-# 同機只有一張 GPU（RTX 5090）：GPU job 一律序列化，避免與其他 repo 的
-# self-hosted job 同時搶卡。
+# 推論在 Genesis Deck 伺服器上，不再搶本機 GPU；只避免同一個 issue 重複觸發時兩個 job 互改。
 concurrency:
-  group: rtx5090-gpu
+  group: local-fix-${{ github.event.issue.number || github.event.inputs.issue_number || github.run_id }}
   cancel-in-progress: false
 
 # runner 是 Windows 機：步驟全用 bash 語法。Windows runner 每個 job 會從
@@ -42,7 +44,7 @@ jobs:
     if: >
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issues' && github.event.label.name == 'local-fix-first')
-    runs-on: [self-hosted, gpu, ollama]
+    runs-on: [self-hosted, Windows]
     steps:
       - uses: actions/checkout@v4
 
@@ -58,9 +60,12 @@ jobs:
           pip install -r requirements.txt
           pip install "git+https://github.com/gsinvest017-ai/gs-agent-router.git"
 
-      - name: Local-first fix attempt (qwen3-coder)
+      - name: Local-first fix attempt (Genesis Deck)
         id: gate
         continue-on-error: true
+        env:
+          AUTOFIX_LOCAL_BACKEND: gdeck
+          GDECK_API_KEY: ${{ secrets.GDECK_API_KEY }}
         run: python scripts/local_autofix_gate.py
 
       - name: local solved -> open PR
@@ -78,11 +83,11 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BR"
           git add -A
-          git commit -m "fix: 地端 qwen3-coder 自動修復（issue #${ISSUE}），未動用雲端模型"
+          git commit -m "fix: 公司地端模型（Genesis Deck）自動修復 issue #${ISSUE}，未動用雲端模型"
           git push origin "$BR"
           gh pr create --head "$BR" --base main \
             --title "地端自動修復 #${ISSUE}" \
-            --body "由 gs-agent-router 地端模型（qwen3-coder）修復，未消耗雲端 token。Closes #${ISSUE}"
+            --body "由公司地端模型（Genesis Deck，經 gs-agent-router）修復，未消耗雲端 token。Closes #${ISSUE}"
 
       - name: local failed -> escalate to cloud
         if: steps.gate.outcome == 'failure' && github.event_name == 'issues'
