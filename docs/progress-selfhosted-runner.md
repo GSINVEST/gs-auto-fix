@@ -87,3 +87,10 @@
   保護規則）；日後常規變更仍應走 PR
 - runner 監控尚未接 gs-obs-radar（offline 目前是靜默的）
 - Mac Studio（arm64）可另註冊補 macOS 測試，未做
+
+## 2026-10-09：地端模型改用 Genesis Deck
+
+- `claude-fix-local.yml` 的地端後端從本機 Ollama qwen3-coder 改成公司地端 Genesis Deck API（`AUTOFIX_LOCAL_BACKEND=gdeck`，需 gs-agent-router 含 `--local-backend gdeck` 的版本，gsinvest017-ai/gs-agent-router#1）。
+- runner 不再需要 GPU：`runs-on` 改成 `[self-hosted, Windows]`，拿掉 `rtx5090-gpu` 的全機序列化。仍須在公司網路內（gateway 只放行公司出口 IP）。
+- repo secret `GDECK_API_KEY`：keyctl #9（`gs-auto-fix-ci`），已設定。
+- 待驗：兩個 PR 都合併後，用一個真實紅測試的 issue 加 `local-fix-first` label 跑完整鏈路。

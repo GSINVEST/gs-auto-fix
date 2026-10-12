@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """gs-auto-fix 地端先修 gate（PoC1）。
 
-跑測試 → 失敗 → 用 gs-agent-router 的地端模型（Ollama qwen3-coder）試修 traceback
-implicated 的檔案；地端修好就回 exit 0，修不掉回 exit 2（由 workflow 升級雲端）。
+跑測試 → 失敗 → 用 gs-agent-router 的地端模型試修 traceback implicated 的檔案；
+地端修好就回 exit 0，修不掉回 exit 2（由 workflow 升級雲端）。
 
-需在 self-hosted GPU runner（已備 Ollama + qwen3-coder）上跑。純 stdlib + gs-agent-router。
+地端後端由環境變數 AUTOFIX_LOCAL_BACKEND 決定（workflow 設成 gdeck＝公司地端 Genesis Deck，
+key 讀 GDECK_API_KEY）；未設時沿用 Ollama qwen3-coder。純 stdlib + gs-agent-router。
 """
 from __future__ import annotations
 
