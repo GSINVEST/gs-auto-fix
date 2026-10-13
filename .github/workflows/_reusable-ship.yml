@@ -299,7 +299,7 @@ jobs:
       - name: 取得流水線輔助腳本
         uses: actions/checkout@v4
         with:
-          repository: gsinvest017-ai/gs-auto-fix
+          repository: GSINVEST/gs-auto-fix
           ref: ${{ inputs.pipeline_ref }}
           path: .ship
 
@@ -569,7 +569,7 @@ jobs:
       - name: 取得流水線輔助腳本
         uses: actions/checkout@v4
         with:
-          repository: gsinvest017-ai/gs-auto-fix
+          repository: GSINVEST/gs-auto-fix
           ref: ${{ inputs.pipeline_ref }}
           path: .ship
 

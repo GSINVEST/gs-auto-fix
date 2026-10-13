@@ -1,7 +1,7 @@
 # 進度：機器人 PR 不再被送去 AI review
 
 **起點**：PR #18（dependabot bump `github/codeql-action` 3 → 4.37.3）的 `Claude PR review`
-job 紅燈，[run 30699145258](https://github.com/gsinvest017-ai/gs-auto-fix/actions/runs/30699145258)。
+job 紅燈，[run 30699145258](https://github.com/GSINVEST/gs-auto-fix/actions/runs/30699145258)。
 
 ## 根因（兩道關卡疊在一起）
 
