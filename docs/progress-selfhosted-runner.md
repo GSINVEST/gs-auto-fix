@@ -8,7 +8,7 @@
 
 ## 計畫 milestone
 
-- **M1** 註冊 runner 到 gsinvest017-ai/gs-auto-fix（labels: gpu, ollama）
+- **M1** 註冊 runner 到 GSINVEST/gs-auto-fix（labels: gpu, ollama）
 - **M2** 修 claude-fix-local.yml 的 Windows 相容性 + 防呆，建本進度檔
 - **M3** workflow_dispatch 端到端驗證 runner 撿到 job 且步驟跑通
 
@@ -69,7 +69,7 @@
 - **停用 runner**：`Stop-ScheduledTask gh-runner-gsautofix`；
   永久移除：`Unregister-ScheduledTask gh-runner-gsautofix` +
   `C:\actions-runner-gsautofix\config.cmd remove --token <gh api -X POST
-  repos/gsinvest017-ai/gs-auto-fix/actions/runners/remove-token>`
+  repos/GSINVEST/gs-auto-fix/actions/runners/remove-token>`
 - **runner 掉線排查**：工作排程器看 `gh-runner-gsautofix` LastTaskResult；
   log 在 `C:\actions-runner-gsautofix\_diag\`
 - **回滾 workflow**：本次變更只動 `claude-fix-local.yml` 與本檔，

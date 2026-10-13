@@ -32,7 +32,7 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-    uses: gsinvest017-ai/gs-auto-fix/.github/workflows/_reusable-pr-review.yml@v1
+    uses: GSINVEST/gs-auto-fix/.github/workflows/_reusable-pr-review.yml@v1
     secrets: inherit
     with:
       project_context: 這個 repo 在做 XXX。
@@ -220,7 +220,7 @@ Claude 訂閱額度共用（見上），而大多數 PR 是小改動。開了 `g
 呼叫端：
 
 ```yaml
-    uses: gsinvest017-ai/gs-auto-fix/.github/workflows/_reusable-pr-review.yml@<含本功能的 tag>
+    uses: GSINVEST/gs-auto-fix/.github/workflows/_reusable-pr-review.yml@<含本功能的 tag>
     secrets: inherit                 # 需要 GDECK_API_KEY（keyctl.sh add <email> <用途>）
     with:
       gdeck_first_pass: true
