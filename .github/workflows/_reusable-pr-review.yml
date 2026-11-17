@@ -93,7 +93,7 @@ jobs:
       PR: ${{ github.event.pull_request.number }}
     steps:
       # base 分支，不是 PR 的 code。給 review 讀 AGENTS.md / 既有原始碼當背景。
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       - name: 準備 needs-work label
         run: |
@@ -322,7 +322,7 @@ jobs:
           steps.precheck.outputs.skip == 'false'
           && steps.precheck.outputs.claude == 'true'
           && (steps.precheck.outputs.gdeck != 'true' || steps.gdeck.outputs.escalate != 'false')
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@cc98b3ae241b0fcfb6a42a2690751afffecb4452  # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}

@@ -46,7 +46,7 @@ jobs:
       (github.event_name == 'issues' && github.event.label.name == 'local-fix-first')
     runs-on: [self-hosted, Windows]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       # setup-python 在 self-hosted 非管理員 Windows 會跑 installer 寫 HKLM 被拒；
       # 專用 runner 機上已有 Python，直接建 per-run venv。

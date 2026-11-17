@@ -6,19 +6,25 @@ on:
 
 jobs:
   enable-auto-merge:
-    # Enable GitHub's native auto-merge for PRs that come from the auto-fix
-    # flow: branches Claude opens (claude/*) or anything explicitly tagged
-    # `auto-merge`. Branch protection still gates the actual merge on CI green
-    # plus any required reviews.
+    # 【供應鏈 P0：預設暫停】所有無人 auto-merge 暫停，仍保留自動開 PR。
+    # 原因：下游私有 repo 在 GitHub Free 沒有 branch protection，「靠 branch
+    # protection 擋實際 merge」的閘門可能不存在；且 AI review 不算人類獨立批准。
+    # 開啟方式：repo Settings -> Variables 設 AUTO_MERGE_ENABLED=true。
+    # 開啟前提：該 repo 有伺服端 branch protection / ruleset（必要 check + 人類或
+    # 受限 SHA 的合併把關）。詳見 docs/supply-chain-p0.md。
+    #
+    # 啟用後行為：對 claude/* 分支或帶 `auto-merge` label 的 PR 啟用 GitHub
+    # 原生 auto-merge，實際 merge 仍由 branch protection 把關。
     if: |
-      startsWith(github.event.pull_request.head.ref, 'claude/') ||
-      contains(github.event.pull_request.labels.*.name, 'auto-merge')
+      vars.AUTO_MERGE_ENABLED == 'true' &&
+      (startsWith(github.event.pull_request.head.ref, 'claude/') ||
+      contains(github.event.pull_request.labels.*.name, 'auto-merge'))
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
     steps:
-      - uses: peter-evans/enable-pull-request-automerge@v3
+      - uses: peter-evans/enable-pull-request-automerge@a660677d5469627102a1c1e11409dd063606628d  # v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           pull-request-number: ${{ github.event.pull_request.number }}
