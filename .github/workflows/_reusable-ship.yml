@@ -197,12 +197,12 @@ jobs:
       image: ${{ steps.out.outputs.image }}
       tags: ${{ steps.meta.outputs.tags }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       # cache-to: type=gha 需要 docker-container driver，預設 driver 不支援 cache export
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f  # v3
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -220,7 +220,7 @@ jobs:
 
       - name: 計算 tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051  # v5
         with:
           images: ${{ steps.name.outputs.image }}
           tags: |
@@ -231,7 +231,7 @@ jobs:
 
       - name: Build & push
         id: push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
         with:
           context: ${{ inputs.build_context }}
           file: ${{ inputs.dockerfile }}
@@ -275,7 +275,7 @@ jobs:
       TEST_ENV: ${{ inputs.test_env }}
       ALLOW_EGRESS: ${{ inputs.allow_egress }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       # 本流水線的輔助腳本住在 gs-auto-fix，不在呼叫端 repo，所以要自己拉一份。
       # ref 由呼叫端用 pipeline_ref 明示（原因見該 input 的說明）。
@@ -297,7 +297,7 @@ jobs:
           fi
 
       - name: 取得流水線輔助腳本
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           repository: gsinvest017-ai/gs-auto-fix
           ref: ${{ inputs.pipeline_ref }}
@@ -329,7 +329,7 @@ jobs:
           fi
           echo "輔助腳本已就緒（pipeline_ref=$REF）"
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -455,7 +455,7 @@ jobs:
 
       - name: 上傳測試報表
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: ship-report-${{ github.sha }}
           path: ship-report/
@@ -497,7 +497,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       AUTOFIX: ${{ inputs.hand_to_autofix }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
         with:
           name: ship-report-${{ github.sha }}
           path: ship-report
@@ -547,7 +547,7 @@ jobs:
       contents: read
       packages: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       # pipeline_ref 會被直接拿去 checkout 然後執行裡面的腳本，所以先擋掉奇形怪狀
       # 的 ref。只接受版本 tag、40 位 commit sha、或 dev/ 開頭的開發分支。
@@ -567,7 +567,7 @@ jobs:
           fi
 
       - name: 取得流水線輔助腳本
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           repository: gsinvest017-ai/gs-auto-fix
           ref: ${{ inputs.pipeline_ref }}

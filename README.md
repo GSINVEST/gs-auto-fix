@@ -4,7 +4,9 @@ GitHub Actions 自動化流水線：CI 失敗 → 自動開 issue → Claude 修
 
 ## 目前已跑通的流程
 
-四段式 auto loop，全程不需要人介入：
+> **供應鏈 P0（2026-11-17）：所有無人 auto-merge 已預設暫停。** `auto-merge.yml` 現須設定 repository variable `AUTO_MERGE_ENABLED=true` 才會動作；預設只做到「自動開 PR + CI + review」，merge 由人處理。原因與重新開啟條件見 [docs/supply-chain-p0.md](docs/supply-chain-p0.md)。下圖中的 auto-merge 一段（H、I、J）在預設狀態下不會自動發生。
+
+四段式 auto loop（auto-merge 段預設暫停）：
 
 ```mermaid
 flowchart TD
