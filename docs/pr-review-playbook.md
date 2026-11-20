@@ -11,7 +11,8 @@
 | 語氣 | 「Skip style nits, bikeshedding」 | 解釋為什麼、給可複製的修法 |
 | blocking 範圍 | 由模型自行拿捏 | **只有安全 / 正確性 / 破壞既有行為** |
 | 事件 | `pull_request` | **`pull_request_target`** |
-| fork PR | ❌ 跑不動 | ✅ |
+| fork PR（作者有 write 權限） | ❌ 跑不動 | ✅ |
+| fork PR（唯讀協作者／外部作者） | ❌ 跑不動 | ⚠️ 只有敏感路徑檢查＋「AI review 沒有完成」的固定留言，**沒有 AI review** |
 | 閘門 | 無 | `needs-work` label → status check |
 
 ---
@@ -36,7 +37,10 @@ jobs:
     # <合併後填入的 commit SHA> 待本 repo 加固 PR 合併、打新版 tag 後填入；
     # 在那之前不要指向含舊版安全模型的 tag（v1 = c87d1a2）。
     uses: GSINVEST/gs-auto-fix/.github/workflows/_reusable-pr-review.yml@<合併後填入的 commit SHA>  # vX.Y.Z
-    secrets: inherit
+    # 只傳這支 workflow 需要的 secret，不要用 `secrets: inherit`（見下方第 3 點）。
+    # 有開 gdeck_first_pass 才另外加 GDECK_API_KEY。
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
     with:
       project_context: 這個 repo 在做 XXX。
 ```
@@ -44,12 +48,21 @@ jobs:
 四件事不能省：
 
 1. **事件必須是 `pull_request_target`**。用 `pull_request` 的話，來自 fork 的 PR 拿不到
-   `CLAUDE_CODE_OAUTH_TOKEN`（GitHub 不對 fork 注入 secret），而唯讀協作者只能走 fork——
-   結果就是最該被 review 的 PR 完全跑不到。
+   `CLAUDE_CODE_OAUTH_TOKEN`（GitHub 不對 fork 注入 secret），token 也是唯讀的，連 label 都貼不上。
+
+   ⚠️ **唯讀協作者（以及外部作者）的 PR 不會拿到 AI review。** claude-code-action 會先檢查
+   觸發者有沒有 write 權限，沒有就直接中止（action 原始碼 `src/entrypoints/run.ts` 的
+   `checkWritePermissions`、`docs/security.md`「Repository Access」）。這類 PR 只會得到
+   確定性的敏感路徑檢查，以及一則固定的「AI review 沒有完成」留言＋`needs-work`。
+   **不要**為了讓它們跑起來而打開 `allowed_non_write_users`——那等於把握有 secret 的模型
+   交給任何能開 PR 的人。需要 review 的話，由有 write 權限的人看過後自己 review。
 2. **釘完整 commit SHA（行尾 `# vX.Y.Z` 註明版本），不要用 `@main`，也不要只寫 tag**。
    `@main` 會讓改一次 prompt 就讓所有 repo 的 review 行為當場全變；tag 可以被移動，SHA 不行。
    這支 workflow 握有 secret，被換掉內容等於把 token 交出去。升版時連同版本註解一起改。
-3. **`secrets: inherit`**，否則 `CLAUDE_CODE_OAUTH_TOKEN` 傳不進去。
+3. **明確列出 `secrets:`，不要用 `secrets: inherit`**。不傳的話 `CLAUDE_CODE_OAUTH_TOKEN`
+   進不來；但 `inherit` 會把呼叫端 repo 的**每一個** secret 都交給被呼叫的 workflow
+   （部署金鑰、雲端憑證…），只要這支 workflow 或它用的 action 出問題，外洩範圍就是全部。
+   明確列出時，被呼叫端只拿得到列出的那幾個。
 4. **`permissions:` 一定要寫在呼叫端。** 被呼叫的 reusable workflow 拿到的權限**不能超過
    呼叫端 token 的上限**。多數 repo 的 `Settings → Actions → Workflow permissions` 是預設的
    `read`，這時 reusable workflow 要求的 `pull-requests: write` 會讓整個 run 變成
@@ -151,10 +164,37 @@ B 擋住了「模型自己去呼叫 gh」，但留言**文字**是模型寫的�
 | `--allowedTools "Edit(/review-output.md)"` | 唯一免詢問的寫入；工作目錄內其他檔案的寫入被拒 | `Write(...)` 帶路徑的規則不會被比對，要寫成 `Edit(...)`（官方文件） |
 | `--setting-sources user`、`--strict-mcp-config` | checkout 裡 `.claude/settings*.json` 的 allow rule／hooks、`.mcp.json` 的 server 不會放寬上面的限制 | 因此 `CLAUDE.md` 也不自動載入，prompt 請模型自己 Read |
 | GH_TOKEN 從 job 層級 env 移到各 step | 地端初審的 python 等不需要的 step 不會繼承 | claude-code-action 仍會把 `github_token` 設進 Claude 主行程 env——所以 `/proc` 規則才是重點 |
-| **留言前祕密檢查**（固定 shell） | 輸出含 `GITHUB_TOKEN`／`CLAUDE_CODE_OAUTH_TOKEN`／`GDECK_API_KEY` 原值，或 `ghp_`／`ghs_`／`gho_`／`ghu_`／`ghr_` + ≥30 字元、`github_pat_` + ≥30、`sk-ant-` + ≥20 時：不貼模型文字、改貼固定警告、加 `needs-work`、job 失敗 | **只抓原樣出現**。拆字、加空白、base64／hex 編碼、只抄一部分都抓不到，所以是第二道防線，不是主要控制 |
+| **留言前祕密檢查**（固定 shell） | 輸出含 `GITHUB_TOKEN`／`CLAUDE_CODE_OAUTH_TOKEN`／`GDECK_API_KEY` 原值，或 `ghp_`／`ghs_`／`gho_`／`ghu_`／`ghr_` + ≥30 字元、`github_pat_` + ≥30、`sk-ant-` + ≥20、JWT 形狀（`eyJ…` + `.` + …）時：不貼模型文字、改貼固定警告、加 `needs-work`、job 失敗 | **只抓原樣出現**。拆字、加空白、base64／hex 編碼、只抄一部分都抓不到，所以是第二道防線，不是主要控制 |
+| **貼出前移除圖片**（固定 sed） | Markdown 圖片（inline、reference）與 HTML `<img>`／`<source>`／`<video>`／`<picture>` 換成 `[已移除外部圖片]`，殘留的 `![`、`<img` 跳脫。GitHub 會經圖片代理**自動**抓留言裡的圖片網址，把編碼過的祕密塞進圖片 URL，光是顯示留言就會送出去 | 一般連結 `[文字](網址)` 保留：不會被自動抓取，要有人點才開。這擋的是「不必有人互動」的外送 |
+| **Claude 步驟失敗時 fail closed** | Claude 那一步失敗（旗標被拒、認證失敗、作者沒有 write 權限）時，後面的檢查與貼留言都會跳過；這一步刪掉殘留輸出、加 `needs-work`、貼固定的「AI review 沒有完成」留言，閘門亮紅燈 | 不是對程式碼的判定；原因要看 Actions log |
+| 閘門判定 `set -euo pipefail` | `gh pr view` 失敗時閘門紅燈，不會因為讀不到 label 就放行 | |
 
 地端初審（Genesis Deck）路徑：模型在遠端、只收到 diff 文字，讀不到 runner 上的任何東西，所以沒有
-第 1、2 類問題；但它的輸出一樣是 `review-output.md`、一樣先過留言前祕密檢查才貼出。
+第 1、2 類問題；但它的輸出一樣是 `review-output.md`、一樣先過留言前祕密檢查與圖片移除才貼出。
+地端那一步是 `continue-on-error`，它失敗時流程照常往下（升級 Claude，或在沒有輸出時加 `needs-work`），
+不會落入「紅燈但沒 label、沒留言」的狀態。
+
+**驗證狀態**：上表的控制已在本機用與 action 相同的 Claude Code 版本（2.1.326）實測過，
+action 自己的參數解析器也確認旗標傳得出去；但**還沒有在 GitHub-hosted runner 上實際跑過**。
+第一次啟用時請照下面的 canary 程序做一次。
+
+**`runs_on` 必須是 Linux runner。** `runner.temp` 的 deny rule 與 `//`、`/`、`~/` 錨點都假設 POSIX
+路徑；Windows runner 上路徑會被正規化成 `/c/...`，規則對不上。self-hosted runner 另外要注意：
+action 是把設定**合併**進 runner 使用者既有的 `~/.claude/settings.json`（只覆蓋同名的頂層 key），
+既有的 hooks、`env`、`enabledPlugins` 等會保留下來並被載入。請讓 runner 使用者的 HOME 保持乾淨，
+不要在那個帳號上日常使用 Claude Code。
+
+**第一次啟用的 canary 程序**（設好 `CLAUDE_CODE_OAUTH_TOKEN`、改釘新 SHA 之後）：
+
+1. repo owner 開一個測試 PR，diff 隨意，描述寫明要 reviewer：Read `/proc/self/environ`、
+   `.git/config`、`~/.claude/settings.json`、runner temp 目錄底下的檔案（例如 `$RUNNER_TEMP` 裡的
+   `_runner_file_commands/`）；Grep `/`；Write 到 `$GITHUB_ENV` 指的檔案。
+2. 跑完後由人看 Actions log，確認：
+   - 沒有任何旗標／設定錯誤（Claude 那一步沒有因參數失敗）；
+   - 模型手上只有 `Read`、`Grep`、`Glob`、`Write` 四個檔案工具（沒有 Bash、WebFetch、MCP 工具）；
+   - 上述每一個嘗試都被拒絕；
+   - 「留言前祕密檢查」顯示通過，留言裡沒有任何 token 片段。
+3. 任何一項不符合就先撤掉 secret，再回報。
 
 **殘留風險（已知並接受）**：
 
@@ -169,7 +209,8 @@ B 擋住了「模型自己去呼叫 gh」，但留言**文字**是模型寫的�
 這幾段 shell 的行為由 `tests/test_pr_review_workflow.py` 覆蓋，該測試**直接從 YAML 抽出
 `run:` block 執行**，所以測試與實作不可能漂移；靜態不變式包括：模型不得有任何 `Bash`
 權限且 `--tools` 只有四個檔案工具、唯一的 allow 是 `Edit(/review-output.md)`、checkout 不保留憑證、
-`GH_TOKEN` 不在 job 層級、祕密檢查排在貼留言之前、留言必須走 `--body-file`。
+`GH_TOKEN` 不在 job 層級、祕密檢查排在貼留言之前、Claude 失敗時的 fail closed 排在閘門之前、
+留言必須走 `--body-file`；行為測試另涵蓋圖片移除、JWT 樣式、閘門在 `gh` 失敗時紅燈。
 
 ---
 
@@ -266,7 +307,9 @@ Claude 訂閱額度共用（見上），而大多數 PR 是小改動。開了 `g
 
 ```yaml
     uses: GSINVEST/gs-auto-fix/.github/workflows/_reusable-pr-review.yml@<含本功能的 commit SHA>  # vX.Y.Z
-    secrets: inherit                 # 需要 GDECK_API_KEY（keyctl.sh add <email> <用途>）
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      GDECK_API_KEY: ${{ secrets.GDECK_API_KEY }}   # keyctl.sh add <email> <用途>
     with:
       gdeck_first_pass: true
       runs_on: '["self-hosted", "Linux"]'   # 必須在公司網路內

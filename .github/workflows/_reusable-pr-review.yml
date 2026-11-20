@@ -4,11 +4,13 @@ name: Reusable teaching-mode PR review
 #
 # 為什麼是 workflow_call 而不是各 repo 各寫一份：
 #   review prompt 是會反覆調的東西。散在 N 個 repo 就等於 N 份會漂移的副本。
-#   本檔是唯一真相來源，各 repo 只放三行 caller stub 並釘 tag。
+#   本檔是唯一真相來源，各 repo 只放三行 caller stub 並釘完整 commit SHA。
 #
 # ⚠️ 呼叫端必須用 `on: pull_request_target`，不能用 `pull_request`。
-#   來自 fork 的 pull_request 事件拿不到 repo secrets、GITHUB_TOKEN 也是唯讀的
-#   ——而「唯讀協作者從 fork 發的 PR」正是最需要被 review 的那一批。
+#   來自 fork 的 pull_request 事件拿不到 repo secrets、GITHUB_TOKEN 也是唯讀的，連 label 都貼不上。
+#   注意：claude-code-action 會拒絕「沒有 write 權限的作者」，所以唯讀協作者從 fork 發的 PR
+#   **不會**拿到 AI review，只會跑確定性的敏感路徑檢查，以及「Claude 步驟失敗時 fail closed」
+#   的固定留言。不要為此打開 allowed_non_write_users。
 #
 # ⚠️ pull_request_target 在 base repo 的 context 執行，握有 secret 與寫入權。
 #   因此本 workflow **絕不 checkout、絕不執行 PR 的程式碼**：
@@ -340,7 +342,11 @@ jobs:
           PY
 
       - name: Claude review（教學語氣）
+        id: claude
         # 沒開地端初審時照舊；開了的話只有地端判定要升級（或地端這一步壞掉、沒有輸出）才跑
+        # 這一步失敗（CLI 不接受某個旗標、認證失敗、PR 作者沒有 write 權限時 action 會
+        # core.setFailed）的話，後面的檢查與貼留言 step 都會被跳過，由「Claude 步驟失敗時
+        # fail closed」補上 label 與留言。
         if: >-
           steps.precheck.outputs.skip == 'false'
           && steps.precheck.outputs.claude == 'true'
@@ -532,7 +538,8 @@ jobs:
             fi
           done
           unset val
-          if grep -E -q -- '(ghs|ghp|gho|ghu|ghr)_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|sk-ant-[A-Za-z0-9_-]{20,}' "$f"; then
+          # GitHub token 前綴、fine-grained PAT、Anthropic key／OAuth token、JWT 形狀（eyJ... . ...）
+          if grep -E -q -- '(ghs|ghp|gho|ghu|ghr)_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|sk-ant-[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}' "$f"; then
             hits="$hits token-pattern"
           fi
 
@@ -576,6 +583,22 @@ jobs:
             | tail -1 | grep -oE '(yes|no)' || true)
           sed -E '/^NEEDS_WORK:[[:space:]]*(yes|no)[[:space:]]*$/d' review-output.md > comment.md
 
+          # 移除會被自動抓取的圖片：GitHub 會經 camo 圖片代理去抓留言裡的圖片 URL，
+          # 若模型把（編碼過的）祕密塞進圖片網址的 query，光是「顯示留言」就會把它送到外部主機，
+          # 而且不必有人點。所以 Markdown 圖片（inline 與 reference 兩種）、HTML <img>／<source>／
+          # <video>／<picture> 一律換成固定文字；剩下沒對上 pattern 的 `![` 與 `<img` 再跳脫掉，
+          # 確保不會被渲染成圖片。一般連結 [文字](網址) 保留：GitHub 不會自動抓取一般連結，
+          # 只有人點了才會開。這一步由固定的 sed 處理檔案，不經模型。
+          # sed -z：整個檔案當一行處理，跨行的 <img ...> 也對得到（GNU sed）。
+          sed -E -z \
+            -e 's/!\[[^]]*\]\([^)]*\)/[已移除外部圖片]/g' \
+            -e 's/!\[[^]]*\]\[[^]]*\]/[已移除外部圖片]/g' \
+            -e 's/<(img|source|video|picture)([[:space:]][^>]*)?>/[已移除外部圖片]/Ig' \
+            -e 's/!\[/!\\[/g' \
+            -e 's/<(img|source|video|picture)/\&lt;\1/Ig' \
+            comment.md > comment.tmp
+          mv comment.tmp comment.md
+
           gh pr comment "$PR" --body-file comment.md
 
           # fail closed：拿不到明確判定就當作要修。注入若想抹掉判定行，結果是被擋，不是被放行。
@@ -585,6 +608,25 @@ jobs:
             [ -z "$verdict" ] && echo "::warning::review 沒有給出明確判定，保守起見標記 needs-work"
             gh pr edit "$PR" --add-label needs-work
           fi
+
+      # Claude 那一步失敗時（CLI 不接受旗標、認證失敗、PR 作者沒有 write 權限 → action 呼叫
+      # core.setFailed），上面的祕密檢查與貼留言 step 都沒有 always()，會被跳過；而開頭的準備
+      # step 已經把 needs-work 拿掉，結果會是「紅燈、沒有 label、沒有留言」，作者看不出原因。
+      # 這裡補上：刪掉可能殘留的模型輸出（不貼它）、加 needs-work、貼一則固定文字。
+      #
+      # 地端初審那一步是 continue-on-error：它失敗時 job 不會變成 failure，escalate 輸出為空，
+      # 流程照常往下走（有 Claude token 就升級 Claude；沒有的話「貼出 review」看不到
+      # review-output.md，會加 needs-work）。所以地端路徑不會落入同樣的狀態，不需要另外補。
+      - name: Claude 步驟失敗時 fail closed
+        if: failure() && steps.claude.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          rm -f review-output.md comment.md
+          gh pr edit "$PR" --add-label needs-work
+          echo 'AI review 沒有完成（設定錯誤、認證失敗，或 PR 作者沒有 write 權限）。這不是對程式碼的判定，請看 Actions log。' > review-failed.md
+          gh pr comment "$PR" --body-file review-failed.md
 
       # 軟閘門。label 是前面的固定邏輯加的，這裡把它翻譯成 status check 的紅/綠。
       # 這是給作者與 reviewer 看的訊號，**不要**設成 required status check
@@ -596,8 +638,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # set -e：gh pr view 失敗（API 錯誤、token 問題）時要紅燈，不能因為讀不到 label 就放行。
+          set -euo pipefail
           labels=$(gh pr view "$PR" --json labels --jq '.labels[].name')
-          if printf '%s\n' "$labels" | grep -qx 'needs-work'; then
+          # 用 here-string 而不是 printf | grep -q：pipefail 下 grep -q 提早結束可能讓 printf
+          # 收到 SIGPIPE、整條管線變成非零，反而被當成「沒有 label」而放行。
+          if grep -qx 'needs-work' <<< "$labels"; then
             echo "::error::review 判定需要修正（needs-work），閘門擋下"
             exit 1
           fi
