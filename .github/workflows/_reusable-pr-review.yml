@@ -628,8 +628,13 @@ jobs:
           #   - 文件裡只要有縮排／在清單或引言裡的 fence，或 fence 出現在 HTML block 裡，就整份都不認 fence
           #     （這些情況下 GitHub 的 container 規則可能讓 fence 提早結束，兩邊的判斷會錯開）；
           #   - 4 格縮排的 indented code 不當程式碼；
-          #   - 行內 code 只認同一行、遇到 | 就停（表格會切 cell）、跳脫的反引號不算、
-          #     HTML 標籤與連結 (…) 裡的反引號不算；HTML block 裡完全不認行內 code。
+          #   - 行內 code 照 cmark 配對，但只在「段落裡每個反引號串都配得到、每個 span 都在同一行、
+          #     span 外沒有 HTML 標籤／autolink／`](`／`$`、沒有表格分隔列」時才認，否則整段不認；
+          #     HTML block 裡完全不認行內 code；
+          #   - 換行與空行用 cmark 的定義（不用 Python 的 splitlines()/strip()）；
+          #   - 固定文字替換不跨行、不吃 HTML 結束記號，HTML block 裡只跳脫，避免改到區塊結構。
+          # 這段邏輯有對 cmark-gfm（GitHub 的 parser）的差分 fuzz 測試，見 tests/test_pr_review_workflow.py。
+          # 需求：runner 上要有 python3 ≥ 3.8（沒有的話這一步 fail closed）。
           # 線性時間：沒有會回溯的巢狀量詞；括號配對用 stack、下一個 > 用預先算好的表。
           # 超過 200 KB 直接 exit 3。python 任何錯誤（含 exit 3）都會讓下面的 if 走 fail closed：
           # 刪掉模型輸出、不貼它、加 needs-work、貼固定留言、這一步失敗。
@@ -640,8 +645,40 @@ jobs:
 
           PLACEHOLDER = "[已移除外部圖片]"
           MAX_BYTES = 200_000
+          # \b 只用在「標籤名後面不能再接字母數字」：比 cmark／瀏覽器的標籤名結尾判定寬
+          # （多擋不會少擋），只影響要不要跳脫。
           TAG_START = re.compile(r"<(?:img|image|source|video|picture|audio|svg)\b", re.I)
-          REFDEF = re.compile(r"^[ ]{0,3}\[([^\]\n]{1,999})\]:", re.M)
+          # 只用來決定 shortcut 圖片要不要換成固定文字（純外觀）；漏抓的話剩下的 `![` 仍會被跳脫。
+          REFDEF = re.compile(r"^[ ]{0,3}\[([^\]\r\n]{1,999})\]:", re.M)
+          MAX_LABEL = 999  # CommonMark 的 link label 上限
+
+          # 空白與換行一律用 CommonMark／cmark 的定義，不用 Python 的 str.split()/strip()/
+          # splitlines()/isspace()/\s：那些還認 \v \f \x1c-\x1e \x85 U+2028 U+2029（換行）以及
+          # NBSP、U+3000（空白），會讓這裡與 GitHub 對「哪裡換行、哪行是空行、什麼是程式碼」判斷錯開。
+          # - 換行：只有 \r\n、\n、\r
+          # - 空行：只含空格與 tab
+          # 先把 cmark 不當換行、但容易被誤當成換行的控制字元換成空格（輸出也是換過的版本，
+          # 所以這裡分析的與 GitHub 渲染的是同一份文字）；開頭的 BOM 去掉。
+          # U+3000、NBSP 不動：對 cmark 它們是一般字元，只是不能被當成空白或換行。
+          # 以碼位寫，不在原始碼裡放這些字元本身（U+2028／U+2029 會打壞 YAML）
+          _CONFUSABLE = {cp: 0x20 for cp in (0x0B, 0x0C, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029)}
+          _BOM = chr(0xFEFF)
+          _LINE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z")
+
+
+          def split_lines(t):
+              """只在 \\r\\n、\\n、\\r 斷行，保留行尾。"""
+              return [m.group(0) for m in _LINE.finditer(t)]
+
+
+          def body_of(line):
+              """去掉行尾的 \\r／\\n（只有這兩個字元）。"""
+              return line.rstrip("\r\n")
+
+
+          def is_blank(body):
+              """CommonMark 的空行：只含空格與 tab（空字串也算）。"""
+              return body.strip(" \t") == ""
 
 
           def strip_prefix(line):
@@ -703,10 +740,18 @@ jobs:
               return None
 
 
+          def html_start(rest):
+              # isalpha() 比 cmark 的 ASCII 標籤名寬：多認成 HTML block 只會讓更多內容被當成非程式碼。
+              return len(rest) > 1 and rest[0] == "<" and (rest[1].isalpha() or rest[1] in "/!?")
+
+
           def blocks(lines, fences):
               """切成 ("fence"|"html"|"normal", text)。回傳 (blocks, poisoned)。"""
               out, poisoned, i = [], False, 0
-              html, marker, marker_seen = False, None, True
+              # HTML 模式：pending 是「還沒看到的結束記號」。type 1–5（<pre>、<!-- 等）要等記號出現、
+              # 之後再遇到空行才結束；其他種類遇到空行就結束。HTML 模式中又出現新的 HTML 開頭時，
+              # 把它的結束記號也加進 pending（GitHub 可能已經結束前一個 block、開了新的一個）。
+              html, pending = False, []
 
               def add(kind, text):
                   if out and out[-1][0] == kind and kind != "fence":
@@ -716,15 +761,18 @@ jobs:
 
               while i < len(lines):
                   raw = lines[i]
-                  body = raw.rstrip("\r\n")
+                  body = body_of(raw)
                   prefix, rest = strip_prefix(body)
                   if html:
                       if fence_like(rest):
                           poisoned = True
-                      if not marker_seen and marker.search(body):
-                          marker_seen = True
+                      if html_start(rest):
+                          m = html_end_marker(rest)
+                          if m is not None and not m.search(rest, 1):
+                              pending.append(m)
+                      pending = [m for m in pending if not m.search(body)]
                       add("html", raw)
-                      if marker_seen and body.strip() == "":
+                      if not pending and is_blank(body):
                           html = False
                       i += 1
                       continue
@@ -735,7 +783,7 @@ jobs:
                           poisoned = True
                       elif not (ch == "`" and "`" in rest[n:]):
                           j = i + 1
-                          while j < len(lines) and not is_closer(lines[j].rstrip("\r\n"), ch, n):
+                          while j < len(lines) and not is_closer(body_of(lines[j]), ch, n):
                               j += 1
                           if j < len(lines):
                               out.append(("fence", ["".join(lines[i:j + 1])]))
@@ -744,13 +792,11 @@ jobs:
                           # 沒關的 fence：GitHub 會把後面全部當程式碼（看不到任何東西），
                           # 這裡反過來全部當非程式碼處理——兩者都不會讓圖片顯示，剝掉比較保險。
                           fences = False
-                  if len(rest) > 1 and rest[0] == "<" and (rest[1].isalpha() or rest[1] in "/!?"):
+                  if html_start(rest):
                       html = True
-                      marker = html_end_marker(rest)
-                      marker_seen = marker is None or bool(marker.search(rest, 1))
+                      m = html_end_marker(rest)
+                      pending = [m] if m is not None and not m.search(rest, 1) else []
                       add("html", raw)
-                      if marker_seen and body.strip() == "":
-                          html = False
                       i += 1
                       continue
                   add("normal", raw)
@@ -759,6 +805,7 @@ jobs:
 
 
           TAGISH = re.compile(r"<[A-Za-z/!?]")
+          MAX_TICKS = 80  # cmark 的 MAXBACKTICKS：更長的反引號串不會開 code span
           DELIM_CHARS = set("|-: \t\r")
 
 
@@ -768,12 +815,13 @@ jobs:
               行內 code 的配對照 cmark：跳脫字元之外，n 個反引號開頭、配下一個「剛好 n 個」的反引號串。
               「少認幾個 code span」不見得安全（會讓後面的反引號配錯對、把圖片包進 code 裡），
               所以只在能確定 GitHub 配對與這裡一致時才認：每個 code span 都在同一行內，
-              且 code span 之外沒有 HTML 標籤／autolink 的 <、連結的 ](、數學的 $，
+              且 code span 之外沒有 HTML 標籤／autolink 的 <、連結的 ](、數學的 $、
+              GFM 延伸 autolink 的開頭（://、www.、@、mailto:、xmpp:——它們會把後面的反引號一起吃進連結），
               段落裡也沒有表格分隔列（表格會用 | 切 cell）。任何一項不符 → 整段都當非程式碼。
               """
               n = len(t)
-              lines = t.split("\n")
-              if any(l.strip() and set(l) <= DELIM_CHARS and "-" in l for l in lines):
+              lines = [body_of(l) for l in split_lines(t)]
+              if any(not is_blank(l) and set(l) <= DELIM_CHARS and "-" in l for l in lines):
                   return [(False, t)]
               runs, i = {}, 0
               while i < n:
@@ -791,35 +839,42 @@ jobs:
                       continue
                   if c == "`":
                       k = run_len(t, i, "`")
-                      lst = runs.get(k, ())
+                      lst = runs.get(k, ()) if k <= MAX_TICKS else ()
                       p = bisect.bisect_left(lst, i + k)
                       if p < len(lst):
                           close = lst[p] + k
                           spans.append((i, close))
                           i = close
                           continue
-                      i += k
-                      continue
+                      # 有配不到的反引號串就整段不認：cmark 的 scan_to_closing_backticks 在「掃到結尾還找不到」
+                      # 之後會啟用一個快取（backticks[n] 只記最近掃過的位置），讓後面本來配得到的開頭也被判成
+                      # 配不到——這裡若照單純規則配對就會與 GitHub 錯開（fuzz 找到的實例）。所有反引號都配得到時
+                      # 那個快取永遠不會啟用，配對才與 GitHub 一致。
+                      return [(False, t)]
                   i += 1
               segs, pos = [], 0
               for s, e in spans:
-                  if "\n" in t[s:e]:
+                  if "\n" in t[s:e] or "\r" in t[s:e]:
                       return [(False, t)]
                   segs.append((False, t[pos:s]))
                   segs.append((True, t[s:e]))
                   pos = e
               segs.append((False, t[pos:]))
               for is_code, seg in segs:
-                  if not is_code and (TAGISH.search(seg) or "](" in seg or "$" in seg):
+                  if not is_code and (TAGISH.search(seg) or AUTOLINKISH.search(seg)
+                                      or "](" in seg or "$" in seg):
                       return [(False, t)]
               return [x for x in segs if x[1]]
+
+
+          AUTOLINKISH = re.compile(r"://|www\.|@|mailto:|xmpp:", re.I)
 
 
           def inline_segments(t):
               """normal 區塊（可能含空行）依空行切成段落，各段落分別處理。"""
               out, buf = [], []
-              for line in t.splitlines(keepends=True):
-                  if line.strip() == "":
+              for line in split_lines(t):
+                  if is_blank(body_of(line)):
                       if buf:
                           out += chunk_segments("".join(buf))
                           buf = []
@@ -831,28 +886,49 @@ jobs:
               return out
 
 
+          _WS_RUN = re.compile(r"[ \t\r\n]+")
+
+
           def norm(label):
-              return " ".join(label.split()).casefold()
+              # cmark 的 label 正規化：連續的空格／tab／換行收成一個空格，再做 case fold。
+              return _WS_RUN.sub(" ", label).strip(" ").casefold()
 
 
-          def strip_images(s, refs):
-              # 1) 圖片類 HTML 標籤 → 固定文字（下一個 > 用預先算好的表，線性）
-              nxt, last = [-1] * (len(s) + 1), -1
+          def next_index(s, chars):
+              """nxt[i] = i 之後（含）第一個屬於 chars 的位置，沒有則為 len(s)。一次反向掃描，線性。"""
+              nxt, last = [len(s)] * (len(s) + 1), len(s)
               for i in range(len(s) - 1, -1, -1):
-                  if s[i] == ">":
+                  if s[i] in chars:
                       last = i
                   nxt[i] = last
-              parts, pos = [], 0
-              for m in TAG_START.finditer(s):
-                  if m.start() < pos:
-                      continue
-                  g = nxt[m.end()] if m.end() < len(s) else -1
-                  if g < 0:
-                      break
-                  parts += [s[pos:m.start()], PLACEHOLDER]
-                  pos = g + 1
-              parts.append(s[pos:])
-              s = "".join(parts)
+              return nxt
+
+
+          def strip_images(s, refs, placeholders=True):
+              """非程式碼文字：換掉／跳脫圖片。
+
+              固定文字替換會「刪掉」一段原文，若那段跨行、或吃到 -->、?>、]]> 這類 HTML block 的結束記號，
+              GitHub 的區塊結構就會變（fuzz 找到的實例：<img…]--> 被換掉後註解沒關，後面的內容變成 raw HTML）。
+              所以替換只用在「同一行內、不含結束記號」的範圍，HTML block 裡完全不替換（placeholders=False）；
+              其他情況只做跳脫：`![` → `!\\[`、圖片類標籤的 `<` → `&lt;`。跳脫不刪字元、不動換行，
+              不會改變區塊結構。
+              """
+              # 1) 圖片類 HTML 標籤 → 固定文字（下一個 > 與下一個換行都用預先算好的表，線性）
+              if placeholders:
+                  gt, nl = next_index(s, ">"), next_index(s, "\r\n")
+                  parts, pos = [], 0
+                  for m in TAG_START.finditer(s):
+                      if m.start() < pos:
+                          continue
+                      g = gt[m.end()]
+                      if g >= len(s) or nl[m.start()] < g:
+                          continue
+                      if s[max(0, g - 2):g + 1] in ("-->", "]]>") or s[g - 1:g + 1] == "?>":
+                          continue
+                      parts += [s[pos:m.start()], PLACEHOLDER]
+                      pos = g + 1
+                  parts.append(s[pos:])
+                  s = "".join(parts)
               # 2) Markdown 圖片 → 固定文字（[] 與 () 用 stack 配對，線性）
               match, sb, sp, i = {}, [], [], 0
               while i < len(s):
@@ -869,16 +945,20 @@ jobs:
                   elif c == ")" and sp:
                       match[sp.pop()] = i
                   i += 1
-              parts, pos, i = [], 0, s.find("![")
+              nl = next_index(s, "\r\n")
+              parts, pos, i = [], 0, (s.find("![") if placeholders else -1)
               while i != -1:
                   j = match.get(i + 1)
                   end = None
-                  if j is not None:
+                  if j is not None and nl[i] > j:
                       after = s[j + 1:j + 2]
                       if after in ("(", "[") and (j + 1) in match:
                           end = match[j + 1] + 1
-                      elif norm(s[i + 2:j]) in refs:
+                      elif j - (i + 2) <= MAX_LABEL and norm(s[i + 2:j]) in refs:
+                          # 超過 999 字元的 label 在 CommonMark 裡不成立；也避免巨大 label 讓正規化變成平方時間
                           end = j + 1
+                  if end is not None and nl[i] < end:
+                      end = None  # 跨行的範圍不替換（只跳脫）
                   if end is None:
                       i = s.find("![", i + 2)
                       continue
@@ -893,8 +973,11 @@ jobs:
 
 
           def neutralize(text):
+              if text.startswith(_BOM):
+                  text = text[1:]
+              text = text.translate(_CONFUSABLE)
               refs = {norm(m.group(1)) for m in REFDEF.finditer(text)}
-              lines = text.splitlines(keepends=True)
+              lines = split_lines(text)
               bl, poisoned = blocks(lines, True)
               if poisoned:
                   bl, _ = blocks(lines, False)
@@ -903,7 +986,7 @@ jobs:
                   if kind == "fence":
                       out.append(chunk)
                   elif kind == "html":
-                      out.append(strip_images(chunk, refs))
+                      out.append(strip_images(chunk, refs, placeholders=False))
                   else:
                       for is_code, seg in inline_segments(chunk):
                           out.append(seg if is_code else strip_images(seg, refs))

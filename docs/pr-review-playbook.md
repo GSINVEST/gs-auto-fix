@@ -172,7 +172,7 @@ B 擋住了「模型自己去呼叫 gh」，但留言**文字**是模型寫的�
 | `--setting-sources user`、`--strict-mcp-config` | checkout 裡 `.claude/settings*.json` 的 allow rule／hooks、`.mcp.json` 的 server 不會放寬上面的限制 | 因此 `CLAUDE.md` 也不自動載入，prompt 請模型自己 Read |
 | GH_TOKEN 從 job 層級 env 移到各 step | 地端初審的 python 等不需要的 step 不會繼承 | claude-code-action 仍會把 `github_token` 設進 Claude 主行程 env——所以 `/proc` 規則才是重點 |
 | **留言前祕密檢查**（固定 shell） | 輸出含 `GITHUB_TOKEN`／`CLAUDE_CODE_OAUTH_TOKEN`／`GDECK_API_KEY` 原值，或 `ghp_`／`ghs_`／`gho_`／`ghu_`／`ghr_` + ≥30 字元、`github_pat_` + ≥30、`sk-ant-` + ≥20、JWT 形狀（`eyJ…` + `.` + …）時：不貼模型文字、改貼固定警告、加 `needs-work`、job 失敗 | **只抓原樣出現**。拆字、加空白、base64／hex 編碼、只抄一部分都抓不到，所以是第二道防線，不是主要控制。**也會誤擋**：只命中「樣式」（不是 secret 原值）時，多半是 diff 裡本來就有的範例或測試 fixture（例如文件裡的範例 JWT、測試用假 token）；此時固定留言會說明「保守起見沒貼出、不代表外洩」，只有命中原值時才要求管理者輪換 |
-| **貼出前移除圖片**（固定的 inline Python，只用標準函式庫） | 非程式碼部分的 Markdown 圖片（inline、reference、collapsed、有定義的 shortcut）與 `<img>`／`<image>`／`<source>`／`<video>`／`<picture>`／`<audio>`／`<svg>` 換成 `[已移除外部圖片]`，剩下的 `![` 全部跳脫、圖片類標籤的 `<` 改成 `&lt;`。GitHub 會經圖片代理**自動**抓留言裡的圖片網址，把編碼過的祕密塞進圖片 URL，光是顯示留言就會送出去 | 程式碼（fenced block、行內 code）一字不改，但判斷一律往「當成非程式碼」偏：只認行首 fence；文件裡有縮排／清單／引言內的 fence 或 HTML block 裡的 fence 時整份不認 fence；行內 code 只在「每個 span 都在同一行，且 span 外沒有 `<` 標籤、`](`、`$`、表格分隔列」時才認。因此清單裡的程式碼區塊可能被加上 `\`。一般連結保留（不會被自動抓）。輸出 > 200 KB 或處理出錯 → fail closed |
+| **貼出前移除圖片**（固定的 inline Python，只用標準函式庫） | 非程式碼部分的 Markdown 圖片（inline、reference、collapsed、有定義的 shortcut）與 `<img>`／`<image>`／`<source>`／`<video>`／`<picture>`／`<audio>`／`<svg>` 換成 `[已移除外部圖片]`，剩下的 `![` 全部跳脫、圖片類標籤的 `<` 改成 `&lt;`。GitHub 會經圖片代理**自動**抓留言裡的圖片網址，把編碼過的祕密塞進圖片 URL，光是顯示留言就會送出去 | 程式碼（fenced block、行內 code）一字不改，但判斷一律往「當成非程式碼」偏：只認行首 fence；文件裡有縮排／清單／引言內的 fence 或 HTML block 裡的 fence 時整份不認 fence；行內 code 只在「段落裡每個反引號串都配得到、每個 span 都在同一行，且 span 外沒有 `<` 標籤、`](`、`$`、`://`／`www.`／`@`（GFM 延伸 autolink）、表格分隔列」時才認。換行只認 `\r\n`／`\n`／`\r`、空行只認「只有空格與 tab」（與 cmark 相同；U+3000、NBSP 不是空白）；`\v` `\f` `\x1c`–`\x1e` `\x85` U+2028 U+2029 先換成空格、開頭 BOM 去掉。固定文字替換只用在「同一行、不含 HTML 結束記號」的範圍，HTML block 裡只跳脫（替換會刪到結構字元而改變區塊結構）。因此清單裡的程式碼區塊可能被加上 `\`。一般連結保留（不會被自動抓）。輸出 > 200 KB 或處理出錯 → fail closed |
 | **Claude 步驟失敗時 fail closed** | Claude 那一步失敗（旗標被拒、認證失敗、觸發者沒有 write 權限）時，後面的檢查與貼留言都會跳過；這一步刪掉殘留輸出、**先**加 `needs-work`、再貼固定的「AI review 沒有完成」留言，閘門亮紅燈。留言帶隱藏標記 `<!-- gs-auto-fix:ai-review-incomplete -->`，PR 上已有就不重貼 | 不是對程式碼的判定；原因要看 Actions log |
 | 閘門判定 `set -euo pipefail` | `gh pr view` 失敗時閘門紅燈，不會因為讀不到 label 就放行 | |
 
@@ -184,6 +184,16 @@ B 擋住了「模型自己去呼叫 gh」，但留言**文字**是模型寫的�
 **驗證狀態**：上表的控制已在本機用與 action 相同的 Claude Code 版本（2.1.326）實測過，
 action 自己的參數解析器也確認旗標傳得出去；但**還沒有在 GitHub-hosted runner 上實際跑過**。
 第一次啟用時請照下面的 canary 程序做一次。
+
+圖片移除另有**差分測試**：測試用 `cmarkgfm`（github/cmark-gfm 的 Python binding，只在測試用）以
+GFM 擴充、允許 raw HTML 的設定渲染移除後的輸出，用 `html.parser` 確認沒有任何 `<img>`／`<image>`／
+`<picture>`／`<source>`／`<video>`／`<audio>`／`<svg>` 元素；除了手寫的繞過案例，還有固定 seed 的
+20,000 份 fuzz 文件在 CI 裡跑。**這是證據不是證明**：cmark-gfm 是 GitHub 用的 parser 函式庫，但
+GitHub.com 的渲染流程還有自己的後處理與 sanitizer（例如數學、mention、emoji），測試沒有涵蓋；
+fuzz 語料也只是抽樣。
+
+**runner 需求**：Linux、`python3` ≥ 3.8（GitHub-hosted ubuntu runner 內建；self-hosted 要自己確認）。
+沒有 `python3` 時「貼出 review」那一步會 fail closed，不會貼出未處理的文字。
 
 **`runs_on` 必須是 Linux runner。** `runner.temp` 的 deny rule 與 `//`、`/`、`~/` 錨點都假設 POSIX
 路徑；Windows runner 上路徑會被正規化成 `/c/...`，規則對不上。self-hosted runner 另外要注意：

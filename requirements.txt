@@ -2,3 +2,6 @@ pytest>=8.0
 # tests/test_pr_review_workflow.py 直接讀 workflow YAML 把 shell 抽出來執行，
 # 避免「測試複製一份腳本」與 YAML 內容漂移。
 PyYAML>=6.0
+# 只在測試用：github/cmark-gfm 的 Python binding。拿 GitHub 的 parser 渲染圖片移除後的輸出做差分測試
+# （_reusable-pr-review.yml 執行時不需要）。釘版本讓 fuzz 結果可重現；裝不起來時測試會失敗而不是 skip。
+cmarkgfm==2025.10.22
