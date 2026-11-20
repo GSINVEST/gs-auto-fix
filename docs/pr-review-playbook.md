@@ -32,7 +32,10 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-    uses: gsinvest017-ai/gs-auto-fix/.github/workflows/_reusable-pr-review.yml@v1
+    # 釘完整 40 碼 commit SHA，行尾註明對應版本。
+    # <合併後填入的 commit SHA> 待本 repo 加固 PR 合併、打新版 tag 後填入；
+    # 在那之前不要指向含舊版安全模型的 tag（v1 = c87d1a2）。
+    uses: GSINVEST/gs-auto-fix/.github/workflows/_reusable-pr-review.yml@<合併後填入的 commit SHA>  # vX.Y.Z
     secrets: inherit
     with:
       project_context: 這個 repo 在做 XXX。
@@ -43,7 +46,9 @@ jobs:
 1. **事件必須是 `pull_request_target`**。用 `pull_request` 的話，來自 fork 的 PR 拿不到
    `CLAUDE_CODE_OAUTH_TOKEN`（GitHub 不對 fork 注入 secret），而唯讀協作者只能走 fork——
    結果就是最該被 review 的 PR 完全跑不到。
-2. **釘 tag（`@v1`）不要用 `@main`**。否則改一次 prompt，所有 repo 的 review 行為當場全變。
+2. **釘完整 commit SHA（行尾 `# vX.Y.Z` 註明版本），不要用 `@main`，也不要只寫 tag**。
+   `@main` 會讓改一次 prompt 就讓所有 repo 的 review 行為當場全變；tag 可以被移動，SHA 不行。
+   這支 workflow 握有 secret，被換掉內容等於把 token 交出去。升版時連同版本註解一起改。
 3. **`secrets: inherit`**，否則 `CLAUDE_CODE_OAUTH_TOKEN` 傳不進去。
 4. **`permissions:` 一定要寫在呼叫端。** 被呼叫的 reusable workflow 拿到的權限**不能超過
    呼叫端 token 的上限**。多數 repo 的 `Settings → Actions → Workflow permissions` 是預設的
@@ -115,19 +120,56 @@ gh secret set CLAUDE_CODE_OAUTH_TOKEN -R <owner>/<repo>         # 貼上上一�
 | 誰做 | 做什麼 |
 |------|--------|
 | workflow（固定邏輯） | 抓 diff 存成 `pr.diff`、`pr-meta.txt` |
-| 模型（`--allowed-tools "Read,Grep,Glob,Write"`） | 讀那兩個檔，把 review 寫進 `review-output.md`，最後一行給 `NEEDS_WORK: yes\|no` |
-| workflow（固定邏輯） | 讀 `review-output.md`、`gh pr comment --body-file`、依判定加 label |
+| 模型（只有 `Read`／`Grep`／`Glob`／`Write`，見下方 C） | 讀那兩個檔，把 review 寫進 `review-output.md`，最後一行給 `NEEDS_WORK: yes\|no` |
+| workflow（固定邏輯） | 留言前祕密檢查 → 讀 `review-output.md`、`gh pr comment --body-file`、依判定加 label |
 
 模型能影響的只剩「留言文字」與「一個 yes/no」，影響不到「對哪個 PR 動作」「用什麼參數」。
 留言用 `--body-file` 而非 `--body "..."`，內容不經 shell 展開。
 
-**殘留風險（已知並接受）**：注入仍可能讓模型給出錯誤的 `NEEDS_WORK` 判定，或在留言裡寫進誤導文字。
-前者用 **fail closed** 降低——判定行缺失或無法辨識時一律標 `needs-work`，所以「把判定行抹掉」
-的注入結果是被擋，不是被放行。後者只是文字，人看得到。
+### C. 模型把祕密抄進留言（2026-11-20 加固）
 
-這三段 shell 的行為由 `tests/test_pr_review_workflow.py` 覆蓋，該測試**直接從 YAML 抽出
-`run:` block 執行**，所以測試與實作不可能漂移；其中兩條是靜態不變式：模型不得有任何 `Bash`
-權限、留言必須走 `--body-file`。
+B 擋住了「模型自己去呼叫 gh」，但留言**文字**是模型寫的、會被原文貼出——GitHub 只遮蔽 log
+裡的 secret，**不遮蔽留言**。所以只要模型讀得到 token，注入文字就能要它「把某個檔案的內容
+附在 review 裡」。加固前查到三個讀得到 token 的地方：
+
+1. `actions/checkout` 沒有 `persist-credentials: false`，`GITHUB_TOKEN` 留在工作目錄的 git 設定裡。
+2. `--allowed-tools "Read,Grep,Glob,Write"` 沒有路徑限制。`--allowedTools` 只是「免詢問清單」，
+   不是「可用工具清單」：`Read` 讀工作目錄外（例如 `/proc/self/environ`，Claude 行程的 env 裡
+   有 `CLAUDE_CODE_OAUTH_TOKEN` 與 `GH_TOKEN`）免詢問；`Write` 寫工作目錄外（例如 runner 的
+   `GITHUB_ENV` 檔）也免詢問；而 Bash 工具其實仍在。本機用同版 Claude Code（2.1.326）實測舊設定：
+   工作目錄外的檔案、`.git/config`、寫工作目錄外的檔案全部放行。
+3. `review-output.md` 不經任何檢查就貼成留言。
+
+現在的控制，依「主要 → 次要」排列：
+
+| 控制 | 擋什麼 | 限制 |
+|---|---|---|
+| checkout `persist-credentials: false` | `.git/config`／checkout 的 include 檔裡不會有 `GITHUB_TOKEN` | claude-code-action 自己會設 credential helper（讀 env 的 `GH_TOKEN`，不寫 token 進設定檔；前提是 `allowed_bots` 有設，所以那一行不要拿掉） |
+| `--tools "Read,Grep,Glob,Write"` + `--disallowedTools "Bash" "Monitor" "WebFetch" … "mcp__*"` | 模型拿不到 shell、網路、子代理、MCP 工具 | Claude Code 自己執行的檢查，不是 OS 沙箱 |
+| settings `blockReadsOutsideWorkingDirectories`／`blockWritesOutsideWorkingDirectories`（+ `denyInsteadOfPrompting`） | 檔案工具讀寫限在工作目錄（`$GITHUB_WORKSPACE`）內：擋 `/proc`、runner temp、`GITHUB_ENV`、`$HOME` 其他地方 | 官方文件說讀取限制會放行「Claude Code 自己需要的檔案」；寫入限制需 Claude Code ≥ 2.1.314 |
+| `--disallowedTools` 路徑規則：`Read(/.git/**)`、`Read(//proc/**)`、`Read(//sys/**)`、`Read(//etc/**)`、`Read(/<runner.temp>/**)`、`~/.claude`、`~/.ssh`、`~/.config` 等 | 與上一列重疊的第二道；也擋工作目錄**內**的 `.git/` | 不能 deny 整個 `~/**`：GitHub-hosted runner 的工作目錄就在 `$HOME` 底下 |
+| `--allowedTools "Edit(/review-output.md)"` | 唯一免詢問的寫入；工作目錄內其他檔案的寫入被拒 | `Write(...)` 帶路徑的規則不會被比對，要寫成 `Edit(...)`（官方文件） |
+| `--setting-sources user`、`--strict-mcp-config` | checkout 裡 `.claude/settings*.json` 的 allow rule／hooks、`.mcp.json` 的 server 不會放寬上面的限制 | 因此 `CLAUDE.md` 也不自動載入，prompt 請模型自己 Read |
+| GH_TOKEN 從 job 層級 env 移到各 step | 地端初審的 python 等不需要的 step 不會繼承 | claude-code-action 仍會把 `github_token` 設進 Claude 主行程 env——所以 `/proc` 規則才是重點 |
+| **留言前祕密檢查**（固定 shell） | 輸出含 `GITHUB_TOKEN`／`CLAUDE_CODE_OAUTH_TOKEN`／`GDECK_API_KEY` 原值，或 `ghp_`／`ghs_`／`gho_`／`ghu_`／`ghr_` + ≥30 字元、`github_pat_` + ≥30、`sk-ant-` + ≥20 時：不貼模型文字、改貼固定警告、加 `needs-work`、job 失敗 | **只抓原樣出現**。拆字、加空白、base64／hex 編碼、只抄一部分都抓不到，所以是第二道防線，不是主要控制 |
+
+地端初審（Genesis Deck）路徑：模型在遠端、只收到 diff 文字，讀不到 runner 上的任何東西，所以沒有
+第 1、2 類問題；但它的輸出一樣是 `review-output.md`、一樣先過留言前祕密檢查才貼出。
+
+**殘留風險（已知並接受）**：
+
+- 注入仍可能讓模型給出錯誤的 `NEEDS_WORK` 判定，或在留言裡寫進誤導文字。前者用 **fail closed**
+  降低——判定行缺失或無法辨識時一律標 `needs-work`，所以「把判定行抹掉」的注入結果是被擋，
+  不是被放行。後者只是文字，人看得到。
+- 上表前幾列都是 Claude Code 的權限檢查，不是 OS 層隔離；Claude 主行程的 env 裡確實有 token。
+  若 Claude Code 的路徑檢查有漏洞（例如未知的 symlink／路徑正規化問題），最後只剩祕密檢查，
+  而它擋不住變形輸出。
+- 工作目錄內的檔案模型都讀得到。不要在 checkout 之前的 step 把任何機密寫進工作目錄。
+
+這幾段 shell 的行為由 `tests/test_pr_review_workflow.py` 覆蓋，該測試**直接從 YAML 抽出
+`run:` block 執行**，所以測試與實作不可能漂移；靜態不變式包括：模型不得有任何 `Bash`
+權限且 `--tools` 只有四個檔案工具、唯一的 allow 是 `Edit(/review-output.md)`、checkout 不保留憑證、
+`GH_TOKEN` 不在 job 層級、祕密檢查排在貼留言之前、留言必須走 `--body-file`。
 
 ---
 
@@ -142,17 +184,20 @@ gh secret set CLAUDE_CODE_OAUTH_TOKEN -R <owner>/<repo>         # 貼上上一�
 
 **② review 判定 → label → status check**
 
-Claude 發現 blocking 問題時執行 `gh pr edit --add-label needs-work`，
-最後一個 step 讀 label 決定 job 紅綠。
+review 判定 `NEEDS_WORK: yes`（或判定缺失、留言前祕密檢查命中）時，由 workflow 的固定邏輯
+執行 `gh pr edit --add-label needs-work`，最後一個 step 讀 label 決定 job 紅綠。
 
 每次執行**開頭會先移除 label**——不清的話，作者修好推新 commit 後，上一輪留下的 label 會讓閘門永遠紅著。
 
-閘門強度取決於 repo 方案：
+**這個 job 不要設成 required status check。** 它是給作者與 reviewer 看的訊號（軟閘門），理由：
 
-| repo | 強度 | 做法 |
-|------|------|------|
-| public / 付費 org（Team 以上） | **硬閘門** | ruleset 加 required status check，紅了就 merge 不了 |
-| Free 方案的 private repo | **軟閘門** | ruleset 設不了；紅燈 + label 只是自律護欄，擋不住有 write 權的人手動 merge |
+- 缺 secret 時 review 乾淨跳過並回綠燈（見「已知限制」），required 了也等於零保護但看起來像有保護。
+- 判定本身可被 prompt injection 影響（見上方安全模型 B／C 的殘留風險）。
+- AI review 不算獨立的人類批准（`docs/supply-chain-p0.md` 暫停無人 auto-merge 的同一個理由）。
+
+要真正擋 merge，請在能設 ruleset 的 repo（public 或付費 org）要求**人類 reviewer 的 approval**
+與 CI 的 required check；Free 方案的 private repo 連這個都設不了，紅燈 + label 只是自律護欄，
+擋不住有 write 權的人手動 merge。
 
 Free private repo 的缺口是**方案問題不是技術問題**，三條路是：搬到付費 org、升級 org 到 Team、
 或把協作者降權成 read 讓他們走 fork-PR。完整說明在本機工具 `gh-branch-guard` 的 README
@@ -189,11 +234,11 @@ CI 與 AI review 都會跑。
 - **Claude Max 額度是共用的。** 所有接上的 repo 都吃同一份訂閱額度，會跟你自己的 Claude Code
   session 互搶。擴散到大量 repo 前先量測。
 - **`needs-work` label 可以被手動移除。** 這是刻意的——誤判時作者要有辦法繼續。
-  代價是軟閘門更軟，硬閘門則不受影響（required check 會重跑）。
-- **`claude-review.yml` 的 `review` job 不要設成 required status check。** 它用 job 層級
+  代價是軟閘門更軟；真正擋 merge 的應該是人類 reviewer 的 approval。
+- **`claude-review.yml` 的 `review` job 也不要設成 required status check。** 它用 job 層級
   `if:` 跳過機器人的 PR，而 job 被整個 skip 時各家 branch protection 對它算 pass 還是
-  pending 並不一致，設成 required 會讓 bot 的 PR 卡在 pending。需要真閘門請用本檔描述的
-  `_reusable-pr-review.yml`——它刻意改成 step 層級跳過，job 一定跑完並綠燈收尾。
+  pending 並不一致，設成 required 會讓 bot 的 PR 卡在 pending。`_reusable-pr-review.yml`
+  刻意改成 step 層級跳過、job 一定跑完，但同樣**不建議**設成 required（理由見「兩道閘門」）。
 - **機器人開的 PR 不會被 review**（`github-actions[bot]` 除外）。dependabot / renovate 的版本
   bump 一律跳過，由 CI 與安全掃描把關。這是**白名單**：新接進來的 bot 預設不 review，
   要放行得同時改 `precheck` 的判斷與 action 的 `allowed_bots`——兩邊不一致就會紅燈，
@@ -201,7 +246,7 @@ CI 與 AI review 都會跑。
   背景見 `docs/progress-bot-pr-review-gate.md`。
 - **⚠️ 沒設 secret 又把這個 job 設成 required check ＝ 零保護但看起來像有保護。**
   缺 secret 時 review 乾淨跳過並回綠燈，git 歷史上會看到「每個 PR 都通過 review」，
-  但實際一次都沒跑過。設 required check 前先確認 secret 已存在：
+  但實際一次都沒跑過。這是不建議設成 required 的理由之一；要確認 review 真的有在跑，先確認 secret 已存在：
   `gh secret list -R <owner>/<repo> | grep CLAUDE_CODE_OAUTH_TOKEN`
 
 ---
@@ -220,7 +265,7 @@ Claude 訂閱額度共用（見上），而大多數 PR 是小改動。開了 `g
 呼叫端：
 
 ```yaml
-    uses: gsinvest017-ai/gs-auto-fix/.github/workflows/_reusable-pr-review.yml@<含本功能的 tag>
+    uses: GSINVEST/gs-auto-fix/.github/workflows/_reusable-pr-review.yml@<含本功能的 commit SHA>  # vX.Y.Z
     secrets: inherit                 # 需要 GDECK_API_KEY（keyctl.sh add <email> <用途>）
     with:
       gdeck_first_pass: true
