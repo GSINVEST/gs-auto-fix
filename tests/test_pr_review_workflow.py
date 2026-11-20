@@ -70,14 +70,26 @@ CHANGED
               # 否則回全部——workflow 若拿掉篩選，「偽造標記」的測試就會失敗。
               if [ -f "{tmp_path.as_posix()}/gh-comments.txt" ]; then
                 case "$*" in
-                  *'select(.author.login=="github-actions"'*)
+                  *'.author.login=="github-actions"'*)
                     while IFS=$'\\t' read -r login body; do
-                      case "$login" in github-actions|'github-actions[bot]') printf '%s\\n' "$body";; esac
+                      case "$login" in github-actions|'github-actions[bot]') ;; *) continue;; esac
+                      # 同樣模擬「留言開頭就是標記」的篩選：jq 式子有 startswith(標記) 時，
+                      # 符合的留言各印一行 found；沒有的話（舊寫法）印留言內容。
+                      case "$*" in
+                        *'startswith("<!-- gs-auto-fix:ai-review-incomplete -->")'*)
+                          body="${{body#"${{body%%[![:space:]]*}}"}}"
+                          case "$body" in '<!-- gs-auto-fix:ai-review-incomplete -->'*) echo found;; esac;;
+                        *) printf '%s\\n' "$body";;
+                      esac
                     done < "{tmp_path.as_posix()}/gh-comments.txt";;
                   *) cut -f2- "{tmp_path.as_posix()}/gh-comments.txt";;
                 esac
               fi
               exit 0
+            fi
+            # gh-comment-fail：貼 review 本身（comment.md）時失敗，模擬留言過長或 API 出錯
+            if [ "$1" = "pr" ] && [ "$2" = "comment" ] && [ -f "{tmp_path.as_posix()}/gh-comment-fail" ]; then
+              case "$*" in *comment.md*) echo "HTTP 422: Body is too long (maximum is 65536 characters)" >&2; exit 1;; esac
             fi
             exit 0
             """
@@ -643,6 +655,127 @@ def test_stripper_cannot_be_tricked_into_treating_images_as_code(tmp_path, body,
     assert not _rendered_fetching_tags(out), f"{why}: {out!r}"
 
 
+# --- fix round 5：隱藏標記、留言長度、貼留言失敗
+
+
+def test_html_comments_are_escaped_so_model_cannot_plant_the_marker(tmp_path):
+    """模型輸出若帶著隱藏標記被 bot 貼出去，之後的 fail_closed 會以為「已經說明過」而不貼說明。
+
+    review 裡沒有正當理由出現 HTML 註解，所以非豁免處的 `<!--` 一律變成文字。
+    """
+    neutralize = _neutralizer_module()["neutralize"]
+    assert neutralize(f"{FAILED_MARKER}\n說明\n") == "&lt;!-- gs-auto-fix:ai-review-incomplete -->\n說明\n"
+    assert neutralize("a <!-- x --> b <!--\n") == "a &lt;!-- x --> b &lt;!--\n"
+    out = _posted_comment(tmp_path, f"前文\n\n{FAILED_MARKER}\n\n後文")
+    assert "<!--" not in out and "&lt;!-- gs-auto-fix:ai-review-incomplete -->" in out
+    # 豁免的 fence 裡仍可能有標記的字面文字——所以去重另外要求「留言開頭就是標記」
+    fenced = f"說明\n\n```html\n{FAILED_MARKER}\n```\n"
+    assert neutralize(fenced) == fenced
+
+
+@pytest.mark.parametrize("step", ["Claude 步驟失敗時 fail closed", VERDICT_STEP])
+@pytest.mark.parametrize(
+    "body",
+    [
+        "review 內文 <!-- gs-auto-fix:ai-review-incomplete --> 夾在中間",
+        "```html <!-- gs-auto-fix:ai-review-incomplete --> ```",
+        "x<!-- gs-auto-fix:ai-review-incomplete -->",
+    ],
+)
+def test_marker_not_at_start_of_bot_comment_does_not_suppress(tmp_path, step, body):
+    """bot 自己貼的留言（例如一則 review）裡夾著標記不算數；只有開頭就是標記的固定留言才算。"""
+    _existing_comments(tmp_path, ("github-actions", body))
+    _run_failclosed_path(tmp_path, step)
+    calls = _calls(tmp_path)
+    assert "pr edit 1 --add-label needs-work" in calls
+    assert "pr comment 1 --body-file review-failed.md" in calls, calls
+
+
+@pytest.mark.parametrize("step", ["Claude 步驟失敗時 fail closed", VERDICT_STEP])
+def test_marker_at_start_after_whitespace_still_suppresses(tmp_path, step):
+    _existing_comments(tmp_path, ("github-actions", f"  {FAILED_MARKER} AI review 沒有完成"))
+    _run_failclosed_path(tmp_path, step)
+    assert "pr comment" not in _calls(tmp_path)
+
+
+def test_review_just_under_comment_limit_is_posted(tmp_path):
+    body = ("這是一段說明文字。" * 10 + "\n\n") * 600      # 55,200 字元
+    body += "字" * (59_000 - len(body) - 1)
+    assert len(body) == 59_000 - 1
+    out = _posted_comment(tmp_path, body)
+    assert len(out) == 59_000
+
+
+def test_output_growing_past_comment_limit_fails_closed(tmp_path):
+    """輸入沒超過 200 KB，但跳脫後變長、超過 GitHub 留言上限（65,536 字元）前的安全線 60,000。"""
+    body = "![" * 25_000                                      # 50,000 字元 → 跳脫後 75,000
+    assert len(_neutralizer_module()["neutralize"](body + "\n")) > 60_000
+    (tmp_path / "review-output.md").write_text(body + "\nNEEDS_WORK: no\n", encoding="utf-8")
+    res = _run(_step_script(VERDICT_STEP), tmp_path, _fake_gh(tmp_path), {})
+    assert res.returncode != 0
+    calls = _calls(tmp_path)
+    assert "--body-file comment.md" not in calls, "太長的留言 GitHub 會拒絕，不要送"
+    assert calls.index("pr edit 1 --add-label needs-work") < calls.index("pr comment 1 --body-file review-failed.md")
+    assert not (tmp_path / "comment.md").exists() and not (tmp_path / "review-output.md").exists()
+
+
+def test_failed_review_comment_post_fails_closed(tmp_path):
+    """`gh pr comment` 貼 review 本身失敗時不能只留一個紅燈：要有 label 與固定留言。"""
+    (tmp_path / "gh-comment-fail").write_text("", encoding="utf-8")
+    (tmp_path / "review-output.md").write_text("## 結論\n可以合 ✅\nNEEDS_WORK: no\n", encoding="utf-8")
+    res = _run(_step_script(VERDICT_STEP), tmp_path, _fake_gh(tmp_path), {})
+    assert res.returncode != 0
+    calls = _calls(tmp_path)
+    assert "pr comment 1 --body-file comment.md" in calls, "有試著貼"
+    assert calls.index("pr edit 1 --add-label needs-work") < calls.index("pr comment 1 --body-file review-failed.md")
+    assert FAILED_MARKER in (tmp_path / "review-failed.md").read_text(encoding="utf-8")
+    assert not (tmp_path / "comment.md").exists() and not (tmp_path / "review-output.md").exists()
+
+
+def test_mmd_fence_is_treated_as_rendered_language():
+    neutralize = _neutralizer_module()["neutralize"]
+    out = neutralize("說明\n\n```mmd\ngraph TD\n```\n\n" + RUST_FENCE)
+    assert "```text mmd" in out and "vec!\\[1, 2]" in out
+    assert not _rendered_fetching_tags(out)
+    assert _rendered_fetching_tags("```mmd\ngraph TD\n```\n")
+
+
+# --- fix round 5：prompt 的排版規則
+#
+# 清單、引言、表格、註腳、HTML、縮排都會讓整份 review 失去「程式碼區塊原樣保留」的豁免，
+# 建議的 Rust／TSX 程式碼就會多出跳脫字元、不能直接複製貼上。兩份 prompt 都要明講。
+_PROMPT_KEYWORDS = [
+    "### 建議 1", "### 修正 1", "一般段落", "項目清單", "編號清單", "引言", "表格", "註腳", "HTML", "縮排",
+    "從行首開始", "單一名稱", "圖片", "安全處理", "複製貼上",
+]
+
+
+def _prompts() -> dict[str, str]:
+    return {"claude": _claude_step()["with"]["prompt"], "gdeck": _step_script("Genesis Deck 初審（地端）")}
+
+
+@pytest.mark.parametrize("which", ["claude", "gdeck"])
+def test_prompts_tell_model_to_avoid_lists_and_keep_fences_at_column_zero(which):
+    prompt = _prompts()[which]
+    missing = [k for k in _PROMPT_KEYWORDS if k not in prompt]
+    assert not missing, f"{which} prompt 缺少排版規則關鍵字：{missing}"
+    # 原有的要求不能被改掉
+    for kept in ("NEEDS_WORK: yes", "NEEDS_WORK: no", "最多三項", "這個 PR 先不要合", "不要編"):
+        assert kept in prompt, f"{which} prompt 少了 {kept!r}"
+
+
+def test_gdeck_footer_note_is_not_a_blockquote():
+    """地端那一步自己加在 review 後面的說明若是引言（> 開頭），每一份地端 review 都會失去豁免。"""
+    script = _step_script("Genesis Deck 初審（地端）")
+    assert "本次 review 由公司地端模型" in script
+    assert '"\\n\\n> 本次 review' not in script
+    neutralize = _neutralizer_module()["neutralize"]
+    m = _re.search(r'note = \("\\n\\n(.*?)"\s*\n\s*"(.*?)\\n"\)', script)
+    assert m, "找不到地端說明文字"
+    body = PLAIN_REVIEW + "\n\n" + m.group(1) + m.group(2) + "\n"
+    assert neutralize(body) == body, "加上地端說明之後，乾淨的 review 仍要保有豁免"
+
+
 def test_oversized_output_fails_closed(tmp_path):
     (tmp_path / "review-output.md").write_text("a" * 300_000 + "\nNEEDS_WORK: no\n", encoding="utf-8")
     res = _run(_step_script(VERDICT_STEP), tmp_path, _fake_gh(tmp_path), {})
@@ -721,7 +854,7 @@ from html.parser import HTMLParser  # noqa: E402
 
 _FETCHING_TAGS = {"img", "image", "picture", "source", "video", "audio", "embed", "object", "iframe", "svg"}
 _RAW_FETCHING = _re.compile(r"<(?:img|image|picture|source|video|audio|embed|object|iframe|svg)\b", _re.I)
-_RENDERED_LANG = _re.compile(r'(?:class="language-|lang=")[^"]*(?:mermaid|geojson|topojson|stl|math)', _re.I)
+_RENDERED_LANG = _re.compile(r'(?:class="language-|lang=")[^"]*(?:mermaid|mmd|geojson|topojson|stl|math)', _re.I)
 _RENDER_OPTS = [
     _CmarkOpts.CMARK_OPT_UNSAFE,
     _CmarkOpts.CMARK_OPT_UNSAFE | _CmarkOpts.CMARK_OPT_LIBERAL_HTML_TAG | _CmarkOpts.CMARK_OPT_FOOTNOTES,
@@ -870,7 +1003,7 @@ _S_FENCE_INDENT = ["", "", "", " ", "  ", "   ", "    ", "\t"]
 _S_FENCE_RUN = ["```", "```", "````", "`````", "~~~", "~~~", "~~~~"]
 _S_FENCE_INFO = [
     "", "", "", "rust", "tsx", "c++", "text", " js", "js x", "a`b", "{.x}", "x" * 21, "~~~", "```",
-    "mermaid", "Mermaid", " MERMAID", "mermaid x", "geojson", "topojson", "stl", "math", "  \t",
+    "mermaid", "Mermaid", " MERMAID", "mermaid x", "geojson", "topojson", "stl", "math", "  \t", "mmd", "MMD",
     # cmark 會解開 info string 裡的 entity 與反斜線跳脫
     "&#109;ermaid", "m&#x65;rmaid", "mer\\maid", "\\mermaid", "x-mermaid", "mermaid,x", "{mermaid}", "\tmath",
 ]

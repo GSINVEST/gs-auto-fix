@@ -195,20 +195,29 @@ action 自己的參數解析器也確認旗標傳得出去；但**還沒有在 G
 2. **唯一的豁免**——fenced code block 同時符合下列條件時，裡面一字不改：
    - 開頭的 ```` ``` ```` 或 `~~~`（至少 3 個）在行首，完全不縮排；
    - info string 是空的，或符合 `^[A-Za-z0-9_+#.-]{1,20}$` 而且（不分大小寫）不含
-     `mermaid`／`geojson`／`topojson`／`stl`／`math`（GitHub 會把這些語言的區塊拿去渲染）；
+     `mermaid`／`mmd`／`geojson`／`topojson`／`stl`／`math`（GitHub 會把這些語言的區塊拿去渲染；
+     `mmd` 是 mermaid 的副檔名，GitHub 認不認沒有查證，列進來不花成本）；
    - 有收尾：同一種字元、至少一樣長、後面只有空格或 tab，而且收尾也在行首；
    - 整份文件在 fence 以外**沒有任何一行**以空格、tab、`>`、`<`、`[^`、清單符號（`- `、`+ `、`* `、
      數字加 `.` 或 `)`）開頭，也沒有任何不符合上面三點的 fence。
    只要有一處不符合，**整份文件都沒有豁免**。也就是說：純散文加上乾淨的頂層程式碼區塊，區塊會被保留；
    用了清單、引言、HTML、註腳或縮排，就全部跳脫。
-3. **其餘一律跳脫**（包含行內 code）：`![` → `!\[`、上表列的標籤 `<` → `&lt;`、語言不單純的 fence 前插入 `text `。
+3. **其餘一律跳脫**（包含行內 code）：`![` → `!\[`、上表列的標籤 `<` → `&lt;`、語言不單純的 fence 前插入 `text `、
+   `<!--` → `&lt;!--`（review 裡沒有正當理由出現 HTML 註解；不擋的話模型可以塞進本 workflow 用來去重的隱藏標記）。
+4. **長度**：處理後超過 60,000 字元就 fail closed（跳脫會讓文字變長，GitHub 的留言上限是 65,536 字元）。
+   貼 review 的 `gh pr comment` 本身失敗時也一樣走 fail closed（先加 label、貼固定留言、這一步失敗），不會只剩一個紅燈。
+
+失敗留言的去重另外要求既有留言**開頭就是**隱藏標記、而且是 Actions bot 貼的：bot 貼出的 review 是模型寫的，
+被豁免的程式碼區塊裡仍可能有標記的字面文字，夾在內文裡的不算數。
 
 **代價（已接受）**：這些只在程式碼本身含有 `![` 或上述標籤時才看得到——
 
 - 行內 code：`` `vec![1]` `` 會顯示成 `vec!\[1]`，`` `<img src={logo} />` `` 會顯示成 `&lt;img src={logo} />`
   （`<Link>`、`<Input>`、`<Source>` 這類 JSX 元件名也會，因為只比對標籤開頭、不分大小寫）。
 - review 裡只要有清單、引言、`<details>` 之類的 HTML 或任何縮排行，程式碼區塊裡的同樣寫法也會多出
-  `\` 或 `&lt;`。prompt 已要求模型把 ``` 從行首寫、不放圖片與 HTML，但 review 用清單很常見，所以這是常態而不是例外。
+  `\` 或 `&lt;`，建議的程式碼就不能直接複製貼上。所以兩份 prompt 都明確要求模型只用標題（例如 `### 建議 1`）與一般段落，
+  不用項目清單、編號清單、引言、表格、註腳、HTML、縮排，所有程式碼放在從行首開始的程式碼區塊；地端初審自己加在最後的
+  說明也從引言改成一般段落。**模型照不照做沒有保證，改 prompt 之後的效果也還沒有量過**（見下面的殘餘風險）。
 - 沒有被豁免的區塊若語言寫成 `rust,ignore`、`js title="x"` 這種非單一名稱，會變成 `text rust,ignore`，失去語法上色。
 - 內容不會被刪：跳脫後的圖片語法會以文字留在留言裡（看得到網址，但不會被自動抓取）。
 
@@ -218,14 +227,19 @@ action 自己的參數解析器也確認旗標傳得出去；但**還沒有在 G
 `mermaid` 等的程式碼區塊。除了歷次 review 找到的繞過案例，CI 裡跑兩個固定 seed 的 fuzzer 各 20,000 份文件：
 片段 fuzzer（隨機相接）與結構化 fuzzer（容器前綴跨行延續、表格、各型 HTML block、各種 fence）。
 
-**還沒有證明的部分**：
+**殘餘風險（給 repo owner；啟用前請讀）**：
 
-- cmark-gfm 是 GitHub 用的 parser 函式庫，但 GitHub.com 的渲染流程還有自己的前後處理與 sanitizer
-  （數學 `$…$`、mention、emoji、圖片代理改寫等），測試沒有涵蓋。`mermaid` 等語言的處理方式是依文件推定的，
-  沒有在 GitHub.com 上實測過。
-- 清單以外的標籤（例如 `style` 屬性裡的 `url()`）靠的是 GitHub 自己的 sanitizer，這裡沒有處理。
-- fuzz 是抽樣，**是證據不是證明**。
-- 這一步**還沒有在 GitHub-hosted runner 上實際跑過**（見上面的驗證狀態）。
+1. **驗證對象是 cmark-gfm，不是 GitHub.com 的完整流程。** cmark-gfm 是 GitHub 用的 parser 函式庫，但 GitHub.com
+   還有自己的前後處理與 sanitizer（mention、emoji、圖片代理改寫等），測試沒有涵蓋。沒有列在上表的標籤，以及
+   `style`／`background` 這類屬性，**唯一的防線是 GitHub 自己的 sanitizer**，這裡沒有處理。
+2. **散文裡的行內數學沒有處理。** `$…$` 與 `$$…$$` 會交給 GitHub 的數學渲染，這一步不動它。
+3. **`mermaid`／`mmd`／`geojson`／`topojson`／`stl`／`math` 的處理從來沒有在 GitHub.com 上測過。** 「不豁免、把語言改成
+   `text`」是依文件推定的；GitHub 實際怎麼從 info string 判斷語言、有沒有別的別名，都沒有查證。
+4. **這支 reusable workflow 還沒有在 GitHub-hosted runner 上跑過**（本 repo 沒有 workflow 呼叫它）。runner 需要 `python3` ≥ 3.8。
+5. **程式碼裡出現跳脫字元的比例。** 第四輪的審查者寫了 20 份擬真的繁體中文 Rust／TSX review，其中 10 份因為用了清單、引言或
+   清單的縮排延續而失去豁免，程式碼區塊裡的 `vec![…]`、`<img …>` 因此多出 `\` 或 `&lt;`。prompt 已在同一個 commit 改成
+   避免這些寫法，但**改完之後的效果沒有量過**；上線後請抽幾則實際的 review 看。
+6. fuzz 是抽樣，**是證據不是證明**。
 
 **runner 需求**：Linux、`python3` ≥ 3.8（GitHub-hosted ubuntu runner 內建；self-hosted 要自己確認）。
 沒有 `python3` 時「貼出 review」那一步會 fail closed，不會貼出未處理的文字。
