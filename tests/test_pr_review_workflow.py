@@ -296,23 +296,163 @@ def test_missing_review_output_is_blocked(tmp_path):
     assert "pr edit 1 --add-label needs-work" in _calls(tmp_path)
 
 
+# ------------------------------------------------------- 留言前祕密檢查
+
+LEAK_STEP = "留言前祕密檢查"
+FAKE_SECRET = "fake-secret-VALUE-0123456789abcdef"
+EMPTY_LEAK_ENV = {"LEAK_GITHUB_TOKEN": "", "LEAK_CLAUDE_TOKEN": "", "LEAK_GDECK_KEY": ""}
+
+
+def _leak_check(tmp_path: Path, text: str | None, env: dict[str, str]):
+    if text is not None:
+        (tmp_path / "review-output.md").write_text(text, encoding="utf-8")
+    return _run(_step_script(LEAK_STEP), tmp_path, _fake_gh(tmp_path), {**EMPTY_LEAK_ENV, **env})
+
+
+def test_leak_check_passes_clean_review(tmp_path):
+    res = _leak_check(tmp_path, "## 結論\n可以合，順帶一提 `ghp_` 是 PAT 的前綴\nNEEDS_WORK: no\n",
+                      {"LEAK_GITHUB_TOKEN": "ghs_realvalue000000000000000000000000"})
+    assert res.returncode == 0, res.stderr
+    assert (tmp_path / "review-output.md").exists(), "乾淨的 review 要留給下一步貼"
+    assert "pr comment" not in _calls(tmp_path)
+
+
+@pytest.mark.parametrize("env_name", ["LEAK_GITHUB_TOKEN", "LEAK_CLAUDE_TOKEN", "LEAK_GDECK_KEY"])
+def test_leak_check_blocks_literal_secret(tmp_path, env_name):
+    res = _leak_check(tmp_path, f"## 結論\n這是你要的：{FAKE_SECRET}\nNEEDS_WORK: no\n",
+                      {env_name: FAKE_SECRET})
+    assert res.returncode != 0
+    assert FAKE_SECRET not in res.stdout + res.stderr, "secret 值絕不能出現在 log"
+    assert env_name in res.stdout + res.stderr, "要說出命中哪一項（名稱，不是值）"
+    calls = _calls(tmp_path)
+    assert "pr comment 1 --body-file leak-blocked.md" in calls
+    assert "pr edit 1 --add-label needs-work" in calls
+    assert FAKE_SECRET not in (tmp_path / "leak-blocked.md").read_text(encoding="utf-8")
+    assert not (tmp_path / "review-output.md").exists(), "模型輸出要刪掉，不能被之後的步驟貼出"
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["ghp_" + "a1B2" * 9, "ghs_" + "Z" * 36, "github_pat_" + "x1_" * 20, "sk-ant-oat01-" + "Q" * 40],
+)
+def test_leak_check_blocks_token_patterns(tmp_path, token):
+    res = _leak_check(tmp_path, f"結論 {token}\nNEEDS_WORK: no\n", {})
+    assert res.returncode != 0
+    assert token not in res.stdout + res.stderr
+    assert "pr comment 1 --body-file leak-blocked.md" in _calls(tmp_path)
+
+
+def test_leak_check_empty_secrets_do_not_false_positive(tmp_path):
+    """secret 沒設（空字串）時 grep -F '' 會永遠成立——必須跳過，不能把每則 review 都擋掉。"""
+    res = _leak_check(tmp_path, "## 結論\n沒問題\nNEEDS_WORK: no\n", {})
+    assert res.returncode == 0, res.stderr
+    assert (tmp_path / "review-output.md").exists()
+
+
+def test_leak_check_missing_output_defers_to_fail_closed(tmp_path):
+    res = _leak_check(tmp_path, None, {"LEAK_GITHUB_TOKEN": FAKE_SECRET})
+    assert res.returncode == 0, res.stderr
+    assert _calls(tmp_path) == ""
+
+
+def test_leak_check_runs_before_posting():
+    """順序不變式：祕密檢查必須在唯一的貼 review 步驟之前，且條件相同。"""
+    doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    names = [s.get("name") for s in doc["jobs"]["review"]["steps"]]
+    assert names.index(LEAK_STEP) < names.index(VERDICT_STEP)
+    steps = {s.get("name"): s for s in doc["jobs"]["review"]["steps"]}
+    assert steps[LEAK_STEP]["if"] == steps[VERDICT_STEP]["if"]
+    # 只有這兩個 step 會把 review-output.md 相關內容貼成留言
+    posting = [s.get("name") for s in doc["jobs"]["review"]["steps"]
+               if "review-output.md" in (s.get("run") or "") and "gh pr comment" in (s.get("run") or "")]
+    assert set(posting) <= {LEAK_STEP, VERDICT_STEP}, posting
+
+
 # ------------------------------------------------------- 靜態安全不變式
 
 
+def _claude_step() -> dict:
+    doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    for step in doc["jobs"]["review"]["steps"]:
+        if step.get("uses", "").startswith("anthropics/claude-code-action"):
+            return step
+    raise AssertionError("找不到 claude-code-action step")
+
+
+def _flag_values(args: str, flag: str) -> list[str]:
+    """抽出 claude_args 裡某個 flag 後面、到下一個 --flag 之前的所有值（與 action 的解析方式一致）。"""
+    import shlex
+
+    tokens = shlex.split(args)
+    out: list[str] = []
+    for i, tok in enumerate(tokens):
+        if tok == flag:
+            for nxt in tokens[i + 1 :]:
+                if nxt.startswith("--"):
+                    break
+                out.append(nxt)
+    return out
+
+
 def test_model_has_no_shell_access():
-    """模型拿到 Bash 就等於 diff 裡的注入文字可以呼叫 gh——這是本 workflow 的核心不變式。
+    """模型拿到 Bash 就等於 diff 裡的注入文字可以呼叫 gh 或 `cat /proc/self/environ`。
 
     `Bash(gh pr comment:*)` 之類的白名單是指令前綴比對，不是參數限制：
     `gh pr comment $PR --body "$(env)"` 會通過比對，而 $( ) 在 shell 展開，
     等於把特權 context 的 token 貼成公開留言。
+
+    而且光是「allowedTools 不列 Bash」不夠：--allowedTools 只是免詢問清單，Bash 仍可用，
+    內建唯讀指令（cat 等）免詢問直接跑。所以要 --tools 限定可用工具、--disallowedTools 移除 Bash。
     """
+    args = _claude_step()["with"]["claude_args"]
+    allowed = _flag_values(args, "--allowedTools") + _flag_values(args, "--allowed-tools")
+    assert not any("Bash" in a for a in allowed), f"不得 allow 任何 Bash: {allowed}"
+    tools = ",".join(_flag_values(args, "--tools")).split(",")
+    assert sorted(tools) == ["Glob", "Grep", "Read", "Write"], f"可用工具只能是讀檔＋Write: {tools}"
+    denied = _flag_values(args, "--disallowedTools")
+    for name in ("Bash", "Monitor", "WebFetch", "mcp__*"):
+        assert name in denied, f"{name} 必須以裸名 deny（從 context 移除）"
+
+
+def test_model_file_tools_are_path_scoped():
+    """寫入只放行 review-output.md；.git、/proc、runner temp 一律 deny；讀寫限在工作目錄。"""
+    step = _claude_step()
+    args = step["with"]["claude_args"]
+    allowed = _flag_values(args, "--allowedTools")
+    assert allowed == ["Edit(/review-output.md)"], f"唯一的 allow 只能是寫 review-output.md: {allowed}"
+    for bare in ("Write", "Read", "Edit"):
+        assert bare not in allowed, f"裸的 {bare} allow 會放行工作目錄外的路徑"
+    denied = _flag_values(args, "--disallowedTools")
+    for rule in ("Read(/.git/**)", "Read(//proc/**)", "Read(//etc/**)",
+                 "Read(/${{ runner.temp }}/**)", "Edit(/${{ runner.temp }}/**)"):
+        assert rule in denied, f"缺少 deny rule {rule}"
+    assert "--strict-mcp-config" in args
+    assert _flag_values(args, "--setting-sources") == ["user"]
+    settings = __import__("json").loads(step["with"]["settings"])["permissions"]
+    assert settings["blockReadsOutsideWorkingDirectories"] is True
+    assert settings["blockWritesOutsideWorkingDirectories"] is True
+
+
+def test_checkout_does_not_persist_credentials():
+    """GITHUB_TOKEN 不能留在模型讀得到的工作目錄 git 設定裡。"""
     doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
-    for step in doc["jobs"]["review"]["steps"]:
-        if step.get("uses", "").startswith("anthropics/claude-code-action"):
-            args = step["with"]["claude_args"]
-            assert "Bash" not in args, f"模型不得擁有任何 Bash 權限: {args}"
-            return
-    raise AssertionError("找不到 claude-code-action step")
+    checkouts = [s for s in doc["jobs"]["review"]["steps"]
+                 if s.get("uses", "").startswith("actions/checkout")]
+    assert checkouts, "找不到 checkout"
+    for s in checkouts:
+        assert (s.get("with") or {}).get("persist-credentials") is False, s
+
+
+def test_gh_token_not_at_job_level():
+    """job 層級 env 會被每一步（含模型那步）繼承；GH_TOKEN 只給要呼叫 gh 的 step。"""
+    doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    assert "GH_TOKEN" not in (doc["jobs"]["review"].get("env") or {})
+    import re
+
+    for s in doc["jobs"]["review"]["steps"]:
+        # 真的呼叫 gh 的行（行首或 $( ) 裡），不算 echo 訊息裡提到的 gh
+        if re.search(r"(^\s*|\$\()gh\s", s.get("run") or "", re.M):
+            assert "GH_TOKEN" in (s.get("env") or {}), f"{s.get('name')} 呼叫 gh 卻沒有 GH_TOKEN"
 
 
 def test_comment_is_posted_via_body_file():
