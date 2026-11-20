@@ -11,8 +11,9 @@
 | 語氣 | 「Skip style nits, bikeshedding」 | 解釋為什麼、給可複製的修法 |
 | blocking 範圍 | 由模型自行拿捏 | **只有安全 / 正確性 / 破壞既有行為** |
 | 事件 | `pull_request` | **`pull_request_target`** |
-| fork PR（作者有 write 權限） | ❌ 跑不動 | ✅ |
-| fork PR（唯讀協作者／外部作者） | ❌ 跑不動 | ⚠️ 只有敏感路徑檢查＋「AI review 沒有完成」的固定留言，**沒有 AI review** |
+| 觸發者有 write 權限的 fork PR 事件 | ❌ 跑不動 | ✅ |
+| 觸發者沒有 write 權限（唯讀協作者／外部作者自己開或 push） | ❌ 跑不動 | ⚠️ 只有敏感路徑檢查＋「AI review 沒有完成」的固定留言，**沒有 AI review** |
+| 維護者 reopen／push 到外部作者的 PR | ❌ 跑不動 | ✅ **會跑**，而且審的是外部作者寫的內容——工具／路徑限制就是為這種情況存在 |
 | 閘門 | 無 | `needs-work` label → status check |
 
 ---
@@ -50,12 +51,18 @@ jobs:
 1. **事件必須是 `pull_request_target`**。用 `pull_request` 的話，來自 fork 的 PR 拿不到
    `CLAUDE_CODE_OAUTH_TOKEN`（GitHub 不對 fork 注入 secret），token 也是唯讀的，連 label 都貼不上。
 
-   ⚠️ **唯讀協作者（以及外部作者）的 PR 不會拿到 AI review。** claude-code-action 會先檢查
-   觸發者有沒有 write 權限，沒有就直接中止（action 原始碼 `src/entrypoints/run.ts` 的
-   `checkWritePermissions`、`docs/security.md`「Repository Access」）。這類 PR 只會得到
-   確定性的敏感路徑檢查，以及一則固定的「AI review 沒有完成」留言＋`needs-work`。
-   **不要**為了讓它們跑起來而打開 `allowed_non_write_users`——那等於把握有 secret 的模型
-   交給任何能開 PR 的人。需要 review 的話，由有 write 權限的人看過後自己 review。
+   ⚠️ **檢查的是「觸發這次事件的使用者」，不是 PR 作者。** claude-code-action 會先檢查
+   `context.actor`（觸發事件的人）有沒有 write 權限，沒有就直接中止（action 原始碼
+   `src/github/validation/permissions.ts` 的 `checkWritePermissions`、`src/entrypoints/run.ts`、
+   `docs/security.md`「Repository Access」）。所以：
+   - 唯讀協作者或外部作者自己 open／push 觸發的事件 → **沒有 AI review**，只會得到確定性的
+     敏感路徑檢查，以及一則固定的「AI review 沒有完成」留言＋`needs-work`。
+   - 但只要是**有 write 權限的維護者**觸發（例如 reopen、或 push 到外部作者的 PR 分支），
+     AI review **會跑**，而它讀的 diff 與描述仍是外部作者寫的。這正是本檔「安全模型」裡
+     工具與路徑限制要擋的情況，不要因為「外部作者跑不到」就放鬆它們。
+
+   **不要**為了讓外部作者的事件也跑起來而打開 `allowed_non_write_users`——那等於把握有 secret
+   的模型交給任何能開 PR 的人。
 2. **釘完整 commit SHA（行尾 `# vX.Y.Z` 註明版本），不要用 `@main`，也不要只寫 tag**。
    `@main` 會讓改一次 prompt 就讓所有 repo 的 review 行為當場全變；tag 可以被移動，SHA 不行。
    這支 workflow 握有 secret，被換掉內容等於把 token 交出去。升版時連同版本註解一起改。
@@ -164,9 +171,9 @@ B 擋住了「模型自己去呼叫 gh」，但留言**文字**是模型寫的�
 | `--allowedTools "Edit(/review-output.md)"` | 唯一免詢問的寫入；工作目錄內其他檔案的寫入被拒 | `Write(...)` 帶路徑的規則不會被比對，要寫成 `Edit(...)`（官方文件） |
 | `--setting-sources user`、`--strict-mcp-config` | checkout 裡 `.claude/settings*.json` 的 allow rule／hooks、`.mcp.json` 的 server 不會放寬上面的限制 | 因此 `CLAUDE.md` 也不自動載入，prompt 請模型自己 Read |
 | GH_TOKEN 從 job 層級 env 移到各 step | 地端初審的 python 等不需要的 step 不會繼承 | claude-code-action 仍會把 `github_token` 設進 Claude 主行程 env——所以 `/proc` 規則才是重點 |
-| **留言前祕密檢查**（固定 shell） | 輸出含 `GITHUB_TOKEN`／`CLAUDE_CODE_OAUTH_TOKEN`／`GDECK_API_KEY` 原值，或 `ghp_`／`ghs_`／`gho_`／`ghu_`／`ghr_` + ≥30 字元、`github_pat_` + ≥30、`sk-ant-` + ≥20、JWT 形狀（`eyJ…` + `.` + …）時：不貼模型文字、改貼固定警告、加 `needs-work`、job 失敗 | **只抓原樣出現**。拆字、加空白、base64／hex 編碼、只抄一部分都抓不到，所以是第二道防線，不是主要控制 |
-| **貼出前移除圖片**（固定 sed） | Markdown 圖片（inline、reference）與 HTML `<img>`／`<source>`／`<video>`／`<picture>` 換成 `[已移除外部圖片]`，殘留的 `![`、`<img` 跳脫。GitHub 會經圖片代理**自動**抓留言裡的圖片網址，把編碼過的祕密塞進圖片 URL，光是顯示留言就會送出去 | 一般連結 `[文字](網址)` 保留：不會被自動抓取，要有人點才開。這擋的是「不必有人互動」的外送 |
-| **Claude 步驟失敗時 fail closed** | Claude 那一步失敗（旗標被拒、認證失敗、作者沒有 write 權限）時，後面的檢查與貼留言都會跳過；這一步刪掉殘留輸出、加 `needs-work`、貼固定的「AI review 沒有完成」留言，閘門亮紅燈 | 不是對程式碼的判定；原因要看 Actions log |
+| **留言前祕密檢查**（固定 shell） | 輸出含 `GITHUB_TOKEN`／`CLAUDE_CODE_OAUTH_TOKEN`／`GDECK_API_KEY` 原值，或 `ghp_`／`ghs_`／`gho_`／`ghu_`／`ghr_` + ≥30 字元、`github_pat_` + ≥30、`sk-ant-` + ≥20、JWT 形狀（`eyJ…` + `.` + …）時：不貼模型文字、改貼固定警告、加 `needs-work`、job 失敗 | **只抓原樣出現**。拆字、加空白、base64／hex 編碼、只抄一部分都抓不到，所以是第二道防線，不是主要控制。**也會誤擋**：只命中「樣式」（不是 secret 原值）時，多半是 diff 裡本來就有的範例或測試 fixture（例如文件裡的範例 JWT、測試用假 token）；此時固定留言會說明「保守起見沒貼出、不代表外洩」，只有命中原值時才要求管理者輪換 |
+| **貼出前移除圖片**（固定的 inline Python，只用標準函式庫） | 非程式碼部分的 Markdown 圖片（inline、reference、collapsed、有定義的 shortcut）與 `<img>`／`<image>`／`<source>`／`<video>`／`<picture>`／`<audio>`／`<svg>` 換成 `[已移除外部圖片]`，剩下的 `![` 全部跳脫、圖片類標籤的 `<` 改成 `&lt;`。GitHub 會經圖片代理**自動**抓留言裡的圖片網址，把編碼過的祕密塞進圖片 URL，光是顯示留言就會送出去 | 程式碼（fenced block、行內 code）一字不改，但判斷一律往「當成非程式碼」偏：只認行首 fence；文件裡有縮排／清單／引言內的 fence 或 HTML block 裡的 fence 時整份不認 fence；行內 code 只在「每個 span 都在同一行，且 span 外沒有 `<` 標籤、`](`、`$`、表格分隔列」時才認。因此清單裡的程式碼區塊可能被加上 `\`。一般連結保留（不會被自動抓）。輸出 > 200 KB 或處理出錯 → fail closed |
+| **Claude 步驟失敗時 fail closed** | Claude 那一步失敗（旗標被拒、認證失敗、觸發者沒有 write 權限）時，後面的檢查與貼留言都會跳過；這一步刪掉殘留輸出、**先**加 `needs-work`、再貼固定的「AI review 沒有完成」留言，閘門亮紅燈。留言帶隱藏標記 `<!-- gs-auto-fix:ai-review-incomplete -->`，PR 上已有就不重貼 | 不是對程式碼的判定；原因要看 Actions log |
 | 閘門判定 `set -euo pipefail` | `gh pr view` 失敗時閘門紅燈，不會因為讀不到 label 就放行 | |
 
 地端初審（Genesis Deck）路徑：模型在遠端、只收到 diff 文字，讀不到 runner 上的任何東西，所以沒有

