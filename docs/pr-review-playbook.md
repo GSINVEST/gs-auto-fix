@@ -3,10 +3,10 @@
 `_reusable-pr-review.yml` 是給「協作者多數沒受過正式程式訓練」的 repo 用的 PR review + 軟閘門。
 本檔是它的正規說明；prompt 本身住在 workflow 裡，改 prompt 請改那支檔案。
 
-與 `claude-review.yml`（本 repo 自用那支）的差別：
+本 repo 自己的 `claude-review.yml` 自 2026-11 起也是這支的 caller（釘 v1.1），不再另外維護一份 prompt。
+舊版直接跑 claude-code-action 並給模型 `Bash(gh api:*)`，已移除。
 
-| | `claude-review.yml` | `_reusable-pr-review.yml` |
-|---|---|---|
+---|---|---|
 | 讀者 | 資深工程師 | **沒受過程式訓練的協作者** |
 | 語氣 | 「Skip style nits, bikeshedding」 | 解釋為什麼、給可複製的修法 |
 | blocking 範圍 | 由模型自行拿捏 | **只有安全 / 正確性 / 破壞既有行為** |
@@ -342,10 +342,7 @@ CI 與 AI review 都會跑。
   session 互搶。擴散到大量 repo 前先量測。
 - **`needs-work` label 可以被手動移除。** 這是刻意的——誤判時作者要有辦法繼續。
   代價是軟閘門更軟；真正擋 merge 的應該是人類 reviewer 的 approval。
-- **`claude-review.yml` 的 `review` job 也不要設成 required status check。** 它用 job 層級
-  `if:` 跳過機器人的 PR，而 job 被整個 skip 時各家 branch protection 對它算 pass 還是
-  pending 並不一致，設成 required 會讓 bot 的 PR 卡在 pending。`_reusable-pr-review.yml`
-  刻意改成 step 層級跳過、job 一定跑完，但同樣**不建議**設成 required（理由見「兩道閘門」）。
+- **`claude-review.yml`（本 repo 自用的 caller）同樣不要設成 required status check。** 理由見「兩道閘門」。
 - **機器人開的 PR 不會被 review**（`github-actions[bot]` 除外）。dependabot / renovate 的版本
   bump 一律跳過，由 CI 與安全掃描把關。這是**白名單**：新接進來的 bot 預設不 review，
   要放行得同時改 `precheck` 的判斷與 action 的 `allowed_bots`——兩邊不一致就會紅燈，

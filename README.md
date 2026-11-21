@@ -150,7 +150,7 @@ gh label create auto-merge --color FBCA04 --description "Auto-merge once CI pass
 |---|---|---|
 | `ci.yml` | push, pull_request | 跑 pytest；若是 main 失敗，呼叫 `open-issue-on-failure` job 建立 issue（label: `auto-fix`, `ci-failure`） |
 | `claude-fix.yml` | issues (opened/labeled), issue_comment, pull_request_review_comment | 收到 `auto-fix` label 或受信任成員的 `@claude` 提及，呼叫 `claude-code-action@v1` 讀 issue/comment、修復、開 `claude/...` PR |
-| `claude-review.yml` | pull_request (opened/synchronize/reopened/ready_for_review) | 對非 draft PR 執行 Claude review，找出 bugs/security/correctness，post 為 PR review comment |
+| `claude-review.yml` | pull_request_target (opened/synchronize/reopened/ready_for_review) | 呼叫 `_reusable-pr-review.yml`（釘 v1.1）審非 draft PR；模型沒有 shell 工具，結果貼成留言與 `needs-work` label |
 | `auto-merge.yml` | pull_request (opened/labeled/...) | 若 head branch 為 `claude/*` 或 PR 帶 `auto-merge` label，呼叫 `peter-evans/enable-pull-request-automerge@v3` 啟用 native auto-merge（squash） |
 
 ## 如何觸發
