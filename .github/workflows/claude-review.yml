@@ -1,62 +1,40 @@
+# 本 repo 自己的 PR review。只留言與貼 needs-work label，不是合併閘門（不要設成 required）。
+#
+# 2026-11 起改為呼叫同一個 repo 的 `_reusable-pr-review.yml`（釘 v1.1 的 commit SHA）。
+# 舊版直接跑 claude-code-action 並給模型 `Bash(gh api:*)`、`Bash(gh pr:*)`，
+# PR 內容有機會誘導它把 token 帶出去；這個 repo 又是 public，風險最高。
+#
+# 為什麼是 pull_request_target、為什麼釘 SHA 而不是 `./`：見 docs/pr-review-playbook.md。
+# 釘 SHA 的理由是「自己也吃發版過的版本」——改 reusable 不會在發 tag 前就影響這裡。
 name: Claude PR review
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, reopened, ready_for_review, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   review:
-    # Skip drafts; review human and Claude-authored PRs alike.
-    #
-    # 其他 bot（dependabot、未來的 renovate…）一律跳過。dependabot 的 PR 有兩道關卡疊在一起，
-    # 兩道都不是這裡放行就能解的（實證：run 30699145258，PR #18）：
-    #   1. claude-code-action 的 allowed_bots 沒放行 dependabot，直接
-    #      「Workflow initiated by non-human actor」exit 1。
-    #   2. 就算放行也一樣跑不動——dependabot 觸發的 `pull_request` run 拿不到 Actions secrets，
-    #      該次 log 裡 `CLAUDE_CODE_OAUTH_TOKEN` 是空字串（repo 明明設了這個 secret）。
-    # 要讓它真的跑起來，得把 token 另外設成 Dependabot secret。但 dependabot 改的正是
-    # `.github/workflows/*.yml`，那等於把 token 交給一個有權改 workflow 的來源——這個洞
-    # GitHub 本來就是刻意堵上的。版本 bump 交給 ci / semgrep / secret-scan 把關就夠。
-    #
-    # 用白名單而不是 `!= 'dependabot[bot]'`：黑名單擋不住下一個接進來的 bot。
-    # （同 94cbfc5 收窄 claude-fix 白名單的理由。）
-    #
-    # ⚠️ 這個 job **不要**設成 required status check。它是 job 層級的 `if:` 跳過，
-    # 而 job 被整個 skip 掉時，各家 branch protection 對它算 pass 還是永遠 pending
-    # 並不一致——設成 required 的話，bot 的 PR 有機會卡在 pending 永遠合不了。
-    # 本 job 只貼留言、沒有 label / 閘門機制，本來就不適合當 gate；需要真閘門請用
-    # `_reusable-pr-review.yml`，它刻意改成 step 層級跳過就是為了避開這個歧義。
-    if: >-
-      github.event.pull_request.draft == false
-      && (github.event.pull_request.user.type != 'Bot'
-      || github.event.pull_request.user.login == 'github-actions[bot]')
-    runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
       issues: write
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
-        with:
-          fetch-depth: 0
-      - uses: anthropics/claude-code-action@cc98b3ae241b0fcfb6a42a2690751afffecb4452  # v1
-        with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          # auto-fix loop 開的 PR 作者是 github-actions[bot]，預設會被
-          # 「Workflow initiated by non-human actor」擋掉——結果是**最需要被審的那些 PR
-          # （Claude 自己寫的）反而完全沒人審**。只放行 github-actions，不用 '*'。
-          allowed_bots: "github-actions"
-          prompt: |
-            Review pull request #${{ github.event.pull_request.number }} in ${{ github.repository }}.
-
-            Focus on:
-            - Correctness bugs and logic errors
-            - Security issues (injection, secret handling, auth)
-            - Obvious performance problems
-            - Missing or wrong tests
-
-            Skip style nits, formatting, and bikeshedding. If the PR looks fine, say so briefly.
-
-            Post a single PR review with `gh pr review ${{ github.event.pull_request.number }} --comment --body "..."`. Use inline comments only when the issue is tied to a specific line.
-          claude_args: '--allowed-tools "Bash(gh pr:*),Bash(gh api:*),Bash(git diff:*),Bash(git log:*),Read,Grep,Glob"'
+    uses: GSINVEST/gs-auto-fix/.github/workflows/_reusable-pr-review.yml@f36d6c2a12c51a4bd13ee660eeb4e3ecb693c176  # v1.1
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+    with:
+      project_context: >-
+        gs-auto-fix 是 GitHub Actions 自動化流水線（CI 失敗 → 開 issue → Claude 修復 → PR review），
+        也提供其他 repo 呼叫的 reusable workflow。這個 repo 是 public。
+        最該注意：workflow 的權限放寬、secret 進到模型拿得到的地方、pull_request_target 下 checkout 或執行 PR 的程式碼、
+        Action 沒釘完整 commit SHA、把模型輸出當指令執行、auto-merge 被重新打開。
+      guard_paths: |
+        (^|/)\.env(\.(local|prod|production|dev|development|staging|test))?(\.local)?$
+        \.(pem|key|p12)$
+      guard_reason: 這些路徑可能含有金鑰，不可以進版控（這個 repo 是 public）。
